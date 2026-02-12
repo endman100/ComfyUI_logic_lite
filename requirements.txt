@@ -1,0 +1,5 @@
+Pillow
+numpy
+PyYAML
+cachetools
+GitPython
