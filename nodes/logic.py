@@ -1221,7 +1221,6 @@ class xyAny:
                     new_y.append(y)
 
         return (new_x, new_y)
-print(time.time(), "123")
 
 class lengthAnything:
     @classmethod
@@ -1533,7 +1532,6 @@ class cleanGPUUsed:
         remove_cache('*')
         return (anything,)
 
-print(time.time(), "123")
 
 class clearCacheKey:
     @classmethod
@@ -1574,8 +1572,6 @@ class clearCacheAll:
     def empty_cache(self, anything, unique_id=None, extra_pnginfo=None):
         remove_cache('*')
         return (anything,)
-
-print(time.time(), "123")
 
 class saveText:
 
@@ -1775,7 +1771,6 @@ class sleep:
         return (any,)
 
 
-print(time.time())
 NODE_CLASS_MAPPINGS = {
     "logic string": String,
     "logic int": Int,
@@ -1864,5 +1859,3 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "logic saveText": "Save Text",
     "logic sleep": "Sleep",
 }
-
-print(time.time(), "123")
