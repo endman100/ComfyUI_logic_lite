@@ -1083,6 +1083,166 @@ class isNone:
         return (True if any is None else False,)
 
 
+class isEmptyString:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "text": ("STRING", {"default": "", "forceInput": True}),
+            },
+            "optional": {
+            }
+        }
+
+    RETURN_TYPES = ("BOOLEAN",)
+    RETURN_NAMES = ("boolean",)
+    FUNCTION = "execute"
+    CATEGORY = "LogicLite/Logic"
+
+    def execute(self, text):
+        return (text == "",)
+
+
+# ---------------------------------------------------------------Bool Logic----------------------------------------------------------------------#
+class boolNOT:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "value": ("BOOLEAN", {"forceInput": True}),
+            },
+        }
+
+    RETURN_TYPES = ("BOOLEAN",)
+    RETURN_NAMES = ("boolean",)
+    FUNCTION = "execute"
+    CATEGORY = "LogicLite/Logic/Bool"
+
+    def execute(self, value):
+        return (not value,)
+
+
+class boolAND:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "a": ("BOOLEAN", {"forceInput": True}),
+                "b": ("BOOLEAN", {"forceInput": True}),
+            },
+        }
+
+    RETURN_TYPES = ("BOOLEAN",)
+    RETURN_NAMES = ("boolean",)
+    FUNCTION = "execute"
+    CATEGORY = "LogicLite/Logic/Bool"
+
+    def execute(self, a, b):
+        return (a and b,)
+
+
+class boolOR:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "a": ("BOOLEAN", {"forceInput": True}),
+                "b": ("BOOLEAN", {"forceInput": True}),
+            },
+        }
+
+    RETURN_TYPES = ("BOOLEAN",)
+    RETURN_NAMES = ("boolean",)
+    FUNCTION = "execute"
+    CATEGORY = "LogicLite/Logic/Bool"
+
+    def execute(self, a, b):
+        return (a or b,)
+
+
+# ---------------------------------------------------------------String Utils----------------------------------------------------------------------#
+class stringTrim:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "text": ("STRING", {"forceInput": True}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("string",)
+    FUNCTION = "execute"
+    CATEGORY = "LogicLite/Logic/String"
+
+    def execute(self, text):
+        return (text.strip(),)
+
+
+class stringLength:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "text": ("STRING", {"forceInput": True}),
+            },
+        }
+
+    RETURN_TYPES = ("INT",)
+    RETURN_NAMES = ("length",)
+    FUNCTION = "execute"
+    CATEGORY = "LogicLite/Logic/String"
+
+    def execute(self, text):
+        return (len(text),)
+
+
+class stringReplace:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "text": ("STRING", {"forceInput": True}),
+                "find": ("STRING", {"default": ""}),
+                "replace": ("STRING", {"default": ""}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("string",)
+    FUNCTION = "execute"
+    CATEGORY = "LogicLite/Logic/String"
+
+    def execute(self, text, find, replace):
+        return (text.replace(find, replace),)
+
+
+class stringSplit:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "text": ("STRING", {"forceInput": True}),
+                "delimiter": ("STRING", {"default": ","}),
+                "index": ("INT", {"default": 0, "min": -999, "max": 999}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "INT")
+    RETURN_NAMES = ("string", "count")
+    FUNCTION = "execute"
+    CATEGORY = "LogicLite/Logic/String"
+
+    def execute(self, text, delimiter, index):
+        parts = text.split(delimiter)
+        count = len(parts)
+        try:
+            result = parts[index]
+        except IndexError:
+            result = ""
+        return (result, count)
+
+
 class isSDXL:
     @classmethod
     def INPUT_TYPES(s):
@@ -1798,6 +1958,14 @@ NODE_CLASS_MAPPINGS = {
     "logic ifElse": IfElse,
     "logic isMaskEmpty": isMaskEmpty,
     "logic isNone": isNone,
+    "logic isEmptyString": isEmptyString,
+    "logic boolNOT": boolNOT,
+    "logic boolAND": boolAND,
+    "logic boolOR": boolOR,
+    "logic stringTrim": stringTrim,
+    "logic stringLength": stringLength,
+    "logic stringReplace": stringReplace,
+    "logic stringSplit": stringSplit,
     "logic isSDXL": isSDXL,
     "logic isFileExist": isFileExist,
     "logic outputToList": outputToList,
@@ -1842,6 +2010,14 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "logic blocker": "Blocker",
     "logic isMaskEmpty": "Is Mask Empty",
     "logic isNone": "Is None",
+    "logic isEmptyString": "Is Empty String",
+    "logic boolNOT": "Bool NOT",
+    "logic boolAND": "Bool AND",
+    "logic boolOR": "Bool OR",
+    "logic stringTrim": "String Trim",
+    "logic stringLength": "String Length",
+    "logic stringReplace": "String Replace",
+    "logic stringSplit": "String Split",
     "logic isSDXL": "Is SDXL",
     "logic isFileExist": "Is File Exist",
     "logic outputToList": "Output to List",
