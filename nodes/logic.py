@@ -1546,8 +1546,6 @@ class batchAnything:
                 return (any_1,)
             return (any_1 + any_2,)
 
-
-# 转换所有类型
 class convertAnything:
     @classmethod
     def INPUT_TYPES(s):
@@ -1574,7 +1572,6 @@ class convertAnything:
             params = bool(anything)
         return (params,)
 
-# 将所有类型的内容都转成字符串输出
 class showAnything:
     @classmethod
     def INPUT_TYPES(s):
@@ -1672,7 +1669,6 @@ class outputToList:
         return (tuple,)
 
 
-# cleanGpuUsed
 class cleanGPUUsed:
     @classmethod
     def INPUT_TYPES(s):
@@ -1927,172 +1923,6 @@ class sleep:
         return (any,)
 
 
-class loadImageBatch:
-    MAX_IMAGES = 16
-
-    def __init__(self):
-        self.output_dir = folder_paths.get_temp_directory()
-        self.type = "temp"
-        self.compress_level = 1
-
-    @classmethod
-    def INPUT_TYPES(s):
-        input_dir = folder_paths.get_input_directory()
-        files = sorted([f for f in os.listdir(input_dir) if os.path.isfile(os.path.join(input_dir, f))])
-        files = folder_paths.filter_files_content_types(files, ["image"])
-        optional_list = ["none"] + files
-        inputs = {
-            "required": {
-                "image_1": (files, {"image_upload": True}),
-            },
-            "optional": {
-                f"image_{i}": (optional_list, {"image_upload": True})
-                for i in range(2, s.MAX_IMAGES + 1)
-            }
-        }
-        return inputs
-
-    CATEGORY = "LogicLite/Logic/Image"
-    RETURN_TYPES = ("IMAGE", "MASK")
-    RETURN_NAMES = ("image_list", "mask_list")
-    OUTPUT_IS_LIST = (True, True)
-    OUTPUT_NODE = True
-    FUNCTION = "load_images"
-
-    def _load_single(self, image_name):
-        import node_helpers
-        from PIL import ImageOps, ImageSequence
-        import torch
-        image_path = folder_paths.get_annotated_filepath(image_name)
-        img = node_helpers.pillow(Image.open, image_path)
-        output_images = []
-        output_masks = []
-        w, h = None, None
-        for frame in ImageSequence.Iterator(img):
-            frame = node_helpers.pillow(ImageOps.exif_transpose, frame)
-            if frame.mode == 'I':
-                frame = frame.point(lambda i: i * (1 / 255))
-            rgb = frame.convert("RGB")
-            if w is None:
-                w, h = rgb.size
-            if rgb.size[0] != w or rgb.size[1] != h:
-                continue
-            image_array = np.array(rgb).astype(np.float32) / 255.0
-            image_tensor = torch.from_numpy(image_array)[None,]
-            if 'A' in frame.getbands():
-                mask = np.array(frame.getchannel('A')).astype(np.float32) / 255.0
-                mask = 1. - torch.from_numpy(mask)
-            elif frame.mode == 'P' and 'transparency' in frame.info:
-                mask = np.array(frame.convert('RGBA').getchannel('A')).astype(np.float32) / 255.0
-                mask = 1. - torch.from_numpy(mask)
-            else:
-                mask = torch.zeros((64, 64), dtype=torch.float32, device="cpu")
-            output_images.append(image_tensor)
-            output_masks.append(mask.unsqueeze(0))
-            if img.format == "MPO":
-                break
-        if len(output_images) > 1:
-            return torch.cat(output_images, dim=0), torch.cat(output_masks, dim=0)
-        return output_images[0], output_masks[0]
-
-    def load_images(self, **kwargs):
-        import uuid
-        import torch
-        all_images = []
-        all_masks = []
-        preview_results = []
-        for i in range(1, self.MAX_IMAGES + 1):
-            name = kwargs.get(f"image_{i}", "none")
-            if name == "none":
-                continue
-            img, mask = self._load_single(name)
-            all_images.append(img)
-            all_masks.append(mask)
-            # 儲存每張圖至暫存資料夾供 UI 預覽
-            for frame_idx in range(img.shape[0]):
-                pil_img = Image.fromarray(
-                    np.clip(255. * img[frame_idx].cpu().numpy(), 0, 255).astype(np.uint8)
-                )
-                filename = f"loadbatch_{uuid.uuid4().hex[:12]}.png"
-                out_path = os.path.join(self.output_dir, filename)
-                pil_img.save(out_path, compress_level=self.compress_level)
-                preview_results.append({"filename": filename, "subfolder": "", "type": self.type})
-        if not all_images:
-            placeholder = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
-            placeholder_mask = torch.zeros((1, 64, 64), dtype=torch.float32)
-            return {"ui": {"images": []}, "result": ([placeholder], [placeholder_mask])}
-        return {"ui": {"images": preview_results}, "result": (all_images, all_masks)}
-
-    @classmethod
-    def IS_CHANGED(s, **kwargs):
-        import hashlib
-        m = hashlib.sha256()
-        for i in range(1, s.MAX_IMAGES + 1):
-            name = kwargs.get(f"image_{i}", "none")
-            if name == "none":
-                continue
-            path = folder_paths.get_annotated_filepath(name)
-            with open(path, 'rb') as f:
-                m.update(f.read())
-        return m.digest().hex()
-
-    @classmethod
-    def VALIDATE_INPUTS(s, **kwargs):
-        for i in range(1, s.MAX_IMAGES + 1):
-            name = kwargs.get(f"image_{i}", "none")
-            if name == "none":
-                continue
-            if not folder_paths.exists_annotated_filepath(name):
-                return f"Invalid image file: {name}"
-        return True
-
-
-class imageListToImages:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "image_list": ("IMAGE",),
-            },
-            "optional": {
-                "mask_list": ("MASK",),
-            }
-        }
-
-    CATEGORY = "LogicLite/Logic/Image"
-    RETURN_TYPES = ("IMAGE", "MASK")
-    RETURN_NAMES = ("images", "masks")
-    INPUT_IS_LIST = True
-    FUNCTION = "to_batch"
-
-    def to_batch(self, image_list, mask_list=None):
-        import torch
-        # 以第一張為基準尺寸，自動 resize 其他張
-        target_h, target_w = image_list[0].shape[1], image_list[0].shape[2]
-        aligned_images = [image_list[0]]
-        for img in image_list[1:]:
-            if img.shape[1] != target_h or img.shape[2] != target_w:
-                img = comfy.utils.common_upscale(
-                    img.movedim(-1, 1), target_w, target_h, "bilinear", "center"
-                ).movedim(1, -1)
-            aligned_images.append(img)
-        out_image = torch.cat(aligned_images, dim=0)
-
-        if mask_list:
-            aligned_masks = [mask_list[0]]
-            for msk in mask_list[1:]:
-                if msk.shape[-2] != target_h or msk.shape[-1] != target_w:
-                    msk = comfy.utils.common_upscale(
-                        msk.unsqueeze(1).float(), target_w, target_h, "bilinear", "center"
-                    ).squeeze(1)
-                aligned_masks.append(msk)
-            out_mask = torch.cat(aligned_masks, dim=0)
-        else:
-            out_mask = torch.zeros((out_image.shape[0], target_h, target_w), dtype=torch.float32)
-
-        return (out_image, out_mask)
-
-
 NODE_CLASS_MAPPINGS = {
     "logic string": String,
     "logic int": Int,
@@ -2144,8 +1974,6 @@ NODE_CLASS_MAPPINGS = {
     "logic cleanGpuUsed": cleanGPUUsed,
     "logic saveText": saveText,
     "logic sleep": sleep,
-    "logic loadImageBatch": loadImageBatch,
-    "logic imageListToImages": imageListToImages,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "logic string": "String",
@@ -2198,6 +2026,4 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "logic cleanGpuUsed": "Clean VRAM Used",
     "logic saveText": "Save Text",
     "logic sleep": "Sleep",
-    "logic loadImageBatch": "Load Image Batch",
-    "logic imageListToImages": "Image List to Images",
 }

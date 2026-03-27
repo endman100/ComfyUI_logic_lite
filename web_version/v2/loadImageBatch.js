@@ -1,211 +1,241 @@
 import { app } from "../../scripts/app.js";
 
-const MAX_IMAGES = 16;
-
-// Hide a widget by collapsing its size to zero (standard pattern used by many ComfyUI extensions)
-function hideWidget(widget) {
-    if (widget._origComputeSize === undefined) {
-        widget._origComputeSize = widget.computeSize;
+// 快取 input 資料夾的圖片清單，避免重複請求
+let _imageListCache = null;
+async function getImageList() {
+    if (_imageListCache) return _imageListCache;
+    try {
+        const resp = await fetch("/object_info/LoadImage");
+        if (resp.ok) {
+            const data = await resp.json();
+            _imageListCache = data?.LoadImage?.input?.required?.image?.[0] ?? [];
+        }
+    } catch (_) {}
+    if (!_imageListCache || _imageListCache.length === 0) {
+        _imageListCache = ["none"];
     }
-    widget.computeSize = () => [0, -4];
+    return _imageListCache;
 }
 
-// Restore a previously hidden widget
-function showWidget(widget) {
-    if (widget._origComputeSize !== undefined) {
-        widget.computeSize = widget._origComputeSize;
-        delete widget._origComputeSize;
-    } else {
-        delete widget.computeSize;
+function splitRaw(value) {
+    return String(value ?? "").replace(/\r/g, "\n").split("\n");
+}
+
+function stringifyPaths(paths) {
+    return paths.join("\n");
+}
+
+function removeDynamicWidgets(node) {
+    const widgets = node.widgets ?? [];
+    for (let i = widgets.length - 1; i >= 0; i--) {
+        if (widgets[i]._logiclitePathRow || widgets[i]._logiclitePathControl) {
+            widgets.splice(i, 1);
+        }
     }
+}
+
+// 依 storageWidget 目前的值，從 ComfyUI /view 載入所有圖片並更新預覽
+function refreshPreview(node, storageWidget) {
+    const paths = splitRaw(storageWidget.value).filter(Boolean);
+    if (!paths.length) {
+        node._logiclitePreviewImgs = [];
+        node.setSize([node.size[0], node._logicliteBaseHeight ?? node.size[1]]);
+        app.graph.setDirtyCanvas(true, false);
+        return;
+    }
+    Promise.all(paths.map(p => new Promise(resolve => {
+        // p 可能是 ComfyUI input 目錄的 filename，或 subfolder/filename
+        const parts = p.split("/");
+        const filename = parts.pop();
+        const subfolder = parts.join("/");
+        const url = `/view?filename=${encodeURIComponent(filename)}&type=input&subfolder=${encodeURIComponent(subfolder)}&rand=${Math.random()}`;
+        const img = new Image();
+        img.onload = () => resolve(img);
+        img.onerror = () => resolve(null);
+        img.src = url;
+    }))).then(imgs => {
+        const valid = imgs.filter(Boolean);
+        node._logiclitePreviewImgs = valid;
+        const base = node._logicliteBaseHeight ?? node.size[1];
+        const nodeW = node.size[0];
+        let extraH = valid.length ? 8 : 0;
+        for (const img of valid) {
+            extraH += Math.round(img.naturalHeight * (nodeW / img.naturalWidth)) + 4;
+        }
+        node.setSize([nodeW, base + extraH]);
+        app.graph.setDirtyCanvas(true, false);
+    });
+}
+
+async function buildPathUI(node, storageWidget) {
+    // 清空預覽圖，確保 computeSize 反映的是純 widget 高度
+    node._logiclitePreviewImgs = [];
+    removeDynamicWidgets(node);
+    const imageList = await getImageList();
+    console.log("[LLB] buildPathUI imageList count:", imageList.length);
+    const paths = splitRaw(storageWidget.value);
+
+    for (let i = 0; i < paths.length; i++) {
+        const idx = i;
+        const current = paths[idx] || "none";
+        // 永遠在頂部加入 "none" 選項，其後才是實際圖片清單
+        const baseOptions = imageList.includes("none") ? imageList : ["none", ...imageList];
+        const options = baseOptions.includes(current) ? baseOptions : [current, ...baseOptions];
+        const row = node.addWidget(
+            "combo",
+            `path_${idx + 1}`,
+            current,
+            (value) => {
+                console.log("[LLB] combo[" + idx + "] changed to:", value);
+                const latest = splitRaw(storageWidget.value);
+                if (idx < latest.length) latest[idx] = value;
+                storageWidget.value = stringifyPaths(latest);
+                refreshPreview(node, storageWidget);
+            },
+            { values: options }
+        );
+        row._logiclitePathRow = true;
+
+        const uploadBtn = node.addWidget(
+            "button",
+            `📤 Upload → slot ${idx + 1}`,
+            null,
+            () => {
+                const input = document.createElement("input");
+                input.type = "file";
+                input.accept = "image/*";
+                input.onchange = async () => {
+                    const file = input.files?.[0];
+                    if (!file) return;
+                    const formData = new FormData();
+                    formData.append("image", file);
+                    formData.append("overwrite", "false");
+                    try {
+                        const resp = await fetch("/upload/image", { method: "POST", body: formData });
+                        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                        const result = await resp.json();
+                        const filename = result.name ?? file.name;
+                        _imageListCache = null;
+                        const latest = splitRaw(storageWidget.value);
+                        if (idx < latest.length) latest[idx] = filename;
+                        storageWidget.value = stringifyPaths(latest);
+                        await buildPathUI(node, storageWidget);
+                    } catch (e) {
+                        console.error("[LLB] Upload failed:", e);
+                    }
+                };
+                input.click();
+            },
+            { serialize: false }
+        );
+        uploadBtn._logiclitePathRow = true;
+    }
+
+    const addBtn = node.addWidget(
+        "button",
+        "➕ Add Path",
+        null,
+        () => {
+            const latest = splitRaw(storageWidget.value);
+            latest.push("none");
+            storageWidget.value = stringifyPaths(latest);
+            buildPathUI(node, storageWidget);
+        },
+        { serialize: false }
+    );
+    addBtn._logiclitePathControl = true;
+
+    const removeBtn = node.addWidget(
+        "button",
+        "➖ Remove Last",
+        null,
+        () => {
+            const latest = splitRaw(storageWidget.value);
+            if (latest.length > 0) latest.pop();
+            storageWidget.value = stringifyPaths(latest);
+            buildPathUI(node, storageWidget);
+        },
+        { serialize: false }
+    );
+    removeBtn._logiclitePathControl = true;
+
+    // buildPathUI 結束後，此時 _logiclitePreviewImgs 為空，
+    // computeSize 回傳的即為純 widget 基礎高度
+    node.setSize(node.computeSize());
+    node._logicliteBaseHeight = node.size[1];
+    console.log("[LLB] buildPathUI done, _logicliteBaseHeight=", node._logicliteBaseHeight);
+    // 立即顯示目前選取的圖片
+    refreshPreview(node, storageWidget);
 }
 
 app.registerExtension({
     name: "LogicLite.LoadImageBatch",
 
+    getCustomWidgets(app) {
+        console.log("[LLB] getCustomWidgets called");
+        return {
+            LIST(node, inputName, inputData, _app) {
+                if (node.comfyClass !== "logic loadImageBatch") {
+                    return {};
+                }
+                console.log("[LLB] LIST widget factory called for", node.comfyClass);
+                const storageWidget = node.addWidget(
+                    "text",
+                    inputName,
+                    "",
+                    () => {},
+                    { serialize: true }
+                );
+                storageWidget.computeSize = () => [0, -4];
+                storageWidget._logicliteStorage = true;
+                return { widget: storageWidget };
+            }
+        };
+    },
+
     beforeRegisterNodeDef(nodeType, nodeData) {
         if (nodeData.name !== "logic loadImageBatch") return;
-
-        // Find the combo widget AND its upload button for a given slot index (2..MAX_IMAGES)
-        // The upload button is an addWidget("button",...) added right after the combo
-        // with { serialize: false, canvasOnly: true }
-        nodeType.prototype._getImageWidgets = function (slotIndex) {
-            const name = `image_${slotIndex}`;
-            const widgets = this.widgets ?? [];
-            const result = [];
-            for (let i = 0; i < widgets.length; i++) {
-                if (widgets[i].name === name) {
-                    result.push(widgets[i]);  // the combo
-                    // upload button is right after: type "button" with serialize:false
-                    const next = widgets[i + 1];
-                    if (next && next.type === "button" && next.options?.serialize === false) {
-                        result.push(next);
-                    }
-                    break;
-                }
-            }
-            return result;
-        };
-
-        // Show/hide image widgets according to this._shownCount
-        // _shownCount = number of EXTRA slots shown beyond image_1
-        nodeType.prototype._applyVisibility = function () {
-            const count = this._shownCount ?? 0;
-            for (let i = 2; i <= MAX_IMAGES; i++) {
-                const visible = i - 1 <= count;
-                for (const w of this._getImageWidgets(i)) {
-                    visible ? showWidget(w) : hideWidget(w);
-                }
-            }
-        };
-
-        // Calculate how many extra slots should be visible based on current widget values
-        // Used for migration of old workflows that don't have extra._shownCount
-        nodeType.prototype._countActiveSlots = function () {
-            let maxActive = 0;
-            for (let i = 2; i <= MAX_IMAGES; i++) {
-                const widgets = this.widgets ?? [];
-                const w = widgets.find(w => w.name === `image_${i}`);
-                if (w && w.value && w.value !== "none") {
-                    maxActive = i - 1;
-                }
-            }
-            return maxActive;
-        };
-
-        // Fetch all currently selected images and render them as node preview
-        nodeType.prototype._refreshPreview = function () {
-            const node = this;
-            const names = [];
-            for (let i = 1; i <= MAX_IMAGES; i++) {
-                const w = (this.widgets ?? []).find(w => w.name === `image_${i}`);
-                if (w && w.value && w.value !== "none") {
-                    names.push(w.value);
-                }
-            }
-            if (!names.length) {
-                node.imgs = [];
-                app.graph.setDirtyCanvas(true, false);
-                return;
-            }
-            Promise.all(
-                names.map(
-                    name =>
-                        new Promise(resolve => {
-                            const img = new Image();
-                            img.onload = () => resolve(img);
-                            img.onerror = () => resolve(null);
-                            img.src = `/view?filename=${encodeURIComponent(name)}&type=input&subfolder=&rand=${Math.random()}`;
-                        })
-                )
-            ).then(imgs => {
-                node.imgs = imgs.filter(Boolean);
-                node.imageIndex = 0;
-                node.setSizeForImage?.();
-                app.graph.setDirtyCanvas(true, false);
-            });
-        };
-
-        // Hook into every image_i combo widget so preview updates on value change
-        nodeType.prototype._setupLivePreview = function () {
-            const node = this;
-            for (let i = 1; i <= MAX_IMAGES; i++) {
-                const w = (this.widgets ?? []).find(w => w.name === `image_${i}`);
-                if (!w || w._livePreviewHooked) continue;
-                const origCallback = w.callback;
-                w.callback = function () {
-                    origCallback?.apply(this, arguments);
-                    node._refreshPreview();
-                };
-                w._livePreviewHooked = true;
-            }
-        };
+        console.log("[LLB] beforeRegisterNodeDef hooking logic loadImageBatch");
 
         const origOnNodeCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {
             origOnNodeCreated?.apply(this, arguments);
-
-            // For fresh nodes, use 0; for pre-configured nodes extra might already be set
-            this._shownCount = this.extra?._shownCount ?? 0;
-            this._applyVisibility();
-            this._setupLivePreview();
-
-            // "➕ Add Image" button (not serialized)
-            this.addWidget("button", "➕ Add Image", null, () => {
-                if (this._shownCount < MAX_IMAGES - 1) {
-                    this._shownCount++;
-                    if (!this.extra) this.extra = {};
-                    this.extra._shownCount = this._shownCount;
-                    this._applyVisibility();
-                    this._setupLivePreview();  // hook newly visible widgets
-                    this.setSize(this.computeSize());
-                    app.graph.setDirtyCanvas(true, false);
-                }
-            }, { serialize: false });
+            // workflow 載入時 app.configuringGraph 為 true，onConfigure 會處理，此處跳過避免重複
+            if (app.configuringGraph) return;
+            const storageWidget = (this.widgets ?? []).find(w => w._logicliteStorage);
+            console.log("[LLB] onNodeCreated, storageWidget found:", !!storageWidget);
+            if (storageWidget) buildPathUI(this, storageWidget);
         };
 
-        // Restore _shownCount when a saved workflow is loaded
         const origOnConfigure = nodeType.prototype.onConfigure;
-        nodeType.prototype.onConfigure = function (info) {
+        nodeType.prototype.onConfigure = function () {
             origOnConfigure?.apply(this, arguments);
-            if (info.extra?._shownCount !== undefined) {
-                // New workflow: use saved count
-                this._shownCount = info.extra._shownCount;
-            } else {
-                // Migration: old workflow without _shownCount
-                // Count how many slots have actual (non-"none") values
-                this._shownCount = this._countActiveSlots();
-                if (!this.extra) this.extra = {};
-                this.extra._shownCount = this._shownCount;
-            }
-            this._applyVisibility();
-            this._setupLivePreview();
-            this.setSize(this.computeSize());
-            // Show preview for already-saved values
-            this._refreshPreview();
+            const storageWidget = (this.widgets ?? []).find(w => w._logicliteStorage);
+            if (storageWidget) buildPathUI(this, storageWidget);
         };
 
-        // Right-click menu: remove last image slot
-        const origGetExtraMenuOptions = nodeType.prototype.getExtraMenuOptions;
-        nodeType.prototype.getExtraMenuOptions = function (_, options) {
-            origGetExtraMenuOptions?.apply(this, arguments);
-            if ((this._shownCount ?? 0) > 0) {
-                options.push({
-                    content: "➖ Remove Last Image",
-                    callback: () => {
-                        this._shownCount--;
-                        if (!this.extra) this.extra = {};
-                        this.extra._shownCount = this._shownCount;
-                        this._applyVisibility();
-                        this.setSize(this.computeSize());
-                        app.graph.setDirtyCanvas(true, false);
-                    },
-                });
-            }
-        };
-
-        // Display all preview images returned by the backend
         const origOnExecuted = nodeType.prototype.onExecuted;
         nodeType.prototype.onExecuted = function (output) {
             origOnExecuted?.apply(this, arguments);
-            const node = this;
-            if (!output?.images?.length) return;
-            Promise.all(
-                output.images.map(
-                    src =>
-                        new Promise(resolve => {
-                            const img = new Image();
-                            img.onload = () => resolve(img);
-                            img.onerror = () => resolve(null);
-                            img.src = `/view?filename=${encodeURIComponent(src.filename)}&type=${src.type}&subfolder=${encodeURIComponent(src.subfolder ?? "")}&rand=${Math.random()}`;
-                        })
-                )
-            ).then(imgs => {
-                node.imgs = imgs.filter(Boolean);
-                node.imageIndex = 0;
-                node.setSizeForImage?.();
-                app.graph.setDirtyCanvas(true, false);
-            });
+            // 圖片 UI 由下拉選單即時控制，不在執行後更新
+        };
+
+        // onDrawBackground: (0,0) = 節點 body 頂端（title 以下）
+        const origOnDrawBackground = nodeType.prototype.onDrawBackground;
+        nodeType.prototype.onDrawBackground = function (ctx) {
+            origOnDrawBackground?.apply(this, arguments);
+            const imgs = this._logiclitePreviewImgs;
+            if (!imgs?.length || this.flags?.collapsed) return;
+            const nodeW = this.size[0];
+            const base = this._logicliteBaseHeight ?? this.size[1];
+            let y = base + 4;
+            for (const img of imgs) {
+                const scale = nodeW / img.naturalWidth;
+                const drawH = Math.round(img.naturalHeight * scale);
+                ctx.drawImage(img, 0, y, nodeW, drawH);
+                y += drawH + 4;
+            }
         };
     },
 });
+
