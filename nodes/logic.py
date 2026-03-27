@@ -1923,6 +1923,79 @@ class sleep:
         return (any,)
 
 
+
+class NumberOperater:
+    """對兩個數字（或可轉換為數字的字串）執行二元運算，輸出 int / float / bool / number 四種型別。"""
+    NUMBER_BINARY_OPS = [">", "<", ">=", "<=", "==", "!=", "+", "-", "*", "/", "//", "%", "**"]
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "a": (any_type, {"default": 0}),
+                "b": (any_type, {"default": 0}),
+                "operator": (NumberOperater.NUMBER_BINARY_OPS, {"default": ">"}),
+            },
+        }
+
+    RETURN_TYPES = ("INT", "FLOAT", "BOOLEAN", any_type)
+    RETURN_NAMES = ("int", "float", "bool", "number")
+    FUNCTION = "execute"
+    CATEGORY = "LogicLite/Logic/Math"
+
+    @staticmethod
+    def _to_number(v):
+        if isinstance(v, bool):
+            return int(v)
+        if isinstance(v, (int, float)):
+            return v
+        s = str(v).strip()
+        try:
+            return int(s)
+        except (ValueError, TypeError):
+            pass
+        try:
+            return float(s)
+        except (ValueError, TypeError):
+            pass
+        return 0
+
+    def execute(self, a=0, b=0, operator=">"):
+        na = self._to_number(a)
+        nb = self._to_number(b)
+
+        _ops = {
+            ">":  lambda x, y: x > y,
+            "<":  lambda x, y: x < y,
+            ">=": lambda x, y: x >= y,
+            "<=": lambda x, y: x <= y,
+            "==": lambda x, y: x == y,
+            "!=": lambda x, y: x != y,
+            "+":  lambda x, y: x + y,
+            "-":  lambda x, y: x - y,
+            "*":  lambda x, y: x * y,
+            "/":  lambda x, y: x / y if y != 0 else float("inf"),
+            "//": lambda x, y: int(x // y) if y != 0 else 0,
+            "%":  lambda x, y: x % y if y != 0 else 0,
+            "**": lambda x, y: x ** y,
+        }
+
+        result = _ops[operator](na, nb)
+
+        if isinstance(result, bool):
+            bool_val = result
+            int_val = int(result)
+            float_val = float(result)
+            number_val = int_val
+        else:
+            number_val = result
+            bool_val = bool(result)
+            int_val = int(result)
+            float_val = float(result)
+
+        return (int_val, float_val, bool_val, number_val)
+
+
 NODE_CLASS_MAPPINGS = {
     "logic string": String,
     "logic int": Int,
@@ -1974,6 +2047,7 @@ NODE_CLASS_MAPPINGS = {
     "logic cleanGpuUsed": cleanGPUUsed,
     "logic saveText": saveText,
     "logic sleep": sleep,
+    "logic numberOperater": NumberOperater,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "logic string": "String",
@@ -2026,4 +2100,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "logic cleanGpuUsed": "Clean VRAM Used",
     "logic saveText": "Save Text",
     "logic sleep": "Sleep",
+    "logic numberOperater": "NumberOperater",
 }
