@@ -621,11 +621,221 @@ class resizeMask:
         return (resized, height, width, divisiblke_by)
 
 
+class gaussianBlurMask:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "mask": ("MASK",),
+                "kernel_size": ("INT", {"default": 15, "min": 1, "max": 255, "step": 2}),
+                "sigma": ("FLOAT", {"default": 3.0, "min": 0.0, "max": 100.0, "step": 0.1}),
+            }
+        }
+
+    CATEGORY = "LogicLite/Logic/Image"
+    RETURN_TYPES = ("MASK",)
+    RETURN_NAMES = ("mask",)
+    FUNCTION = "blur"
+
+    def _normalize_kernel_size(self, kernel_size):
+        kernel_size = max(1, int(kernel_size))
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+        return kernel_size
+
+    def _blur_tensor(self, mask, kernel_size, sigma):
+        import torch
+        import torch.nn.functional as F
+
+        source = mask.detach()
+        device = source.device
+        dtype = source.dtype
+
+        if kernel_size <= 1:
+            return source.clone().to(device=device, dtype=dtype)
+
+        if sigma <= 0:
+            sigma = 0.3 * ((kernel_size - 1) * 0.5 - 1) + 0.8
+
+        if source.ndim == 2:
+            batch = source.unsqueeze(0)
+            squeeze_batch = True
+        elif source.ndim == 3:
+            batch = source
+            squeeze_batch = False
+        else:
+            raise ValueError(f"Unsupported mask shape: {tuple(mask.shape)}")
+
+        x = batch.to(device=device, dtype=torch.float32).unsqueeze(1)
+        coords = torch.arange(kernel_size, device=device, dtype=torch.float32) - (kernel_size - 1) / 2
+        kernel_1d = torch.exp(-(coords ** 2) / (2 * sigma * sigma))
+        kernel_1d = kernel_1d / kernel_1d.sum()
+
+        padding = kernel_size // 2
+        x = F.pad(x, (padding, padding, 0, 0), mode="replicate")
+        x = F.conv2d(x, kernel_1d.view(1, 1, 1, kernel_size))
+        x = F.pad(x, (0, 0, padding, padding), mode="replicate")
+        x = F.conv2d(x, kernel_1d.view(1, 1, kernel_size, 1))
+
+        result = x.squeeze(1).clamp(0.0, 1.0)
+        if squeeze_batch:
+            result = result.squeeze(0)
+        return result.to(device=device, dtype=dtype)
+
+    def blur(self, mask, kernel_size=15, sigma=3.0):
+        if isinstance(kernel_size, (list, tuple)):
+            kernel_size = kernel_size[0]
+        if isinstance(sigma, (list, tuple)):
+            sigma = sigma[0]
+
+        kernel_size = self._normalize_kernel_size(kernel_size)
+        sigma = float(sigma)
+
+        if isinstance(mask, (list, tuple)):
+            return ([self._blur_tensor(item, kernel_size, sigma) for item in mask],)
+        return (self._blur_tensor(mask, kernel_size, sigma),)
+
+
+class imageColorToMask:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "red": ("INT", {"default": 255, "min": 0, "max": 255, "step": 1}),
+                "green": ("INT", {"default": 255, "min": 0, "max": 255, "step": 1}),
+                "blue": ("INT", {"default": 255, "min": 0, "max": 255, "step": 1}),
+                "threshold": ("FLOAT", {"default": 30.0, "min": 0.0, "max": 441.6729, "step": 0.1}),
+                "invert": ("BOOLEAN", {"default": False}),
+            }
+        }
+
+    CATEGORY = "LogicLite/Logic/Image"
+    RETURN_TYPES = ("MASK",)
+    RETURN_NAMES = ("mask",)
+    FUNCTION = "color_to_mask"
+
+    def _first_value(self, value):
+        if isinstance(value, (list, tuple)):
+            return value[0]
+        return value
+
+    def _color_to_mask_tensor(self, image, red, green, blue, threshold, invert):
+        import torch
+
+        source = image.detach()
+        device = source.device
+
+        if source.ndim == 3:
+            source = source.unsqueeze(0)
+            squeeze_batch = True
+        elif source.ndim == 4:
+            squeeze_batch = False
+        else:
+            raise ValueError(f"Unsupported image shape: {tuple(image.shape)}")
+
+        if source.shape[-1] < 3:
+            rgb = source[..., :1].repeat_interleave(3, dim=-1)
+        else:
+            rgb = source[..., :3]
+
+        target = torch.tensor(
+            [float(red), float(green), float(blue)],
+            dtype=torch.float32,
+            device=device,
+        ).view(1, 1, 1, 3) / 255.0
+        threshold = float(threshold) / 255.0
+
+        distance = torch.linalg.vector_norm(rgb.to(dtype=torch.float32) - target, dim=-1)
+        mask = (distance <= threshold).to(dtype=torch.float32)
+        if invert:
+            mask = 1.0 - mask
+        if squeeze_batch:
+            mask = mask.squeeze(0)
+        return mask
+
+    def color_to_mask(self, image, red=255, green=255, blue=255, threshold=30.0, invert=False):
+        red = int(self._first_value(red))
+        green = int(self._first_value(green))
+        blue = int(self._first_value(blue))
+        threshold = float(self._first_value(threshold))
+        invert = bool(self._first_value(invert))
+
+        if isinstance(image, (list, tuple)):
+            return ([self._color_to_mask_tensor(item, red, green, blue, threshold, invert) for item in image],)
+        return (self._color_to_mask_tensor(image, red, green, blue, threshold, invert),)
+
+
+class maskFromBatch:
+    @classmethod
+    def INPUT_TYPES(s):
+        from nodes import MAX_RESOLUTION
+
+        return {
+            "required": {
+                "mask": ("MASK",),
+                "batch_index": ("INT", {"default": 0, "min": -MAX_RESOLUTION, "max": MAX_RESOLUTION}),
+                "length": ("INT", {"default": 1, "min": 1, "max": 4096}),
+            }
+        }
+
+    CATEGORY = "LogicLite/Logic/Image"
+    RETURN_TYPES = ("MASK",)
+    RETURN_NAMES = ("mask",)
+    FUNCTION = "frombatch"
+    SEARCH_ALIASES = ["select mask", "pick from batch", "extract mask"]
+
+    def _first_value(self, value):
+        if isinstance(value, (list, tuple)):
+            return value[0]
+        return value
+
+    def _from_tensor_batch(self, mask, batch_index, length):
+        source = mask.detach()
+        if source.ndim == 2:
+            source = source.unsqueeze(0)
+        elif source.ndim != 3:
+            raise ValueError(f"Unsupported mask shape: {tuple(mask.shape)}")
+
+        if batch_index < 0:
+            batch_index += source.shape[0]
+        batch_index = max(0, min(source.shape[0] - 1, batch_index))
+        length = min(source.shape[0] - batch_index, length)
+        return source[batch_index:batch_index + length].clone()
+
+    def frombatch(self, mask, batch_index=0, length=1):
+        import torch
+
+        batch_index = int(self._first_value(batch_index))
+        length = int(self._first_value(length))
+
+        if isinstance(mask, (list, tuple)):
+            if not mask:
+                raise ValueError("Cannot get mask from an empty batch")
+            if batch_index < 0:
+                batch_index += len(mask)
+            batch_index = max(0, min(len(mask) - 1, batch_index))
+            length = min(len(mask) - batch_index, length)
+            selected = []
+            for item in mask[batch_index:batch_index + length]:
+                if item.ndim == 2:
+                    selected.append(item.unsqueeze(0))
+                elif item.ndim == 3:
+                    selected.append(item)
+                else:
+                    raise ValueError(f"Unsupported mask shape: {tuple(item.shape)}")
+            return (torch.cat(selected, dim=0),)
+        return (self._from_tensor_batch(mask, batch_index, length),)
+
+
 NODE_CLASS_MAPPINGS = {
     "logic loadImageBatch": loadImageBatch,
     "logic imageListToImages": imageListToImages,
     "logic resizeImage": resizeImage,
     "logic resizeMask": resizeMask,
+    "logic gaussianBlurMask": gaussianBlurMask,
+    "logic imageColorToMask": imageColorToMask,
+    "logic maskFromBatch": maskFromBatch,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -633,4 +843,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "logic imageListToImages": "Image List to Images",
     "logic resizeImage": "Resize Image",
     "logic resizeMask": "Resize Mask",
+    "logic gaussianBlurMask": "Gaussian Blur Mask",
+    "logic imageColorToMask": "Image Color to Mask",
+    "logic maskFromBatch": "Get Mask from Batch",
 }
