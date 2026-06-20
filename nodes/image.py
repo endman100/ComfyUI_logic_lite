@@ -766,6 +766,135 @@ class imageColorToMask:
         return (self._color_to_mask_tensor(image, red, green, blue, threshold, invert),)
 
 
+class dominantImageColor:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+            },
+            "optional": {
+                "mask": ("MASK",),
+            }
+        }
+
+    CATEGORY = "LogicLite/Logic/Image"
+    RETURN_TYPES = ("INT", "INT", "INT")
+    RETURN_NAMES = ("red", "green", "blue")
+    FUNCTION = "dominant_color"
+
+    def _images_to_batch(self, images):
+        import torch
+
+        if not images:
+            raise ValueError("Cannot get dominant color from an empty image list")
+        if not all(isinstance(item, torch.Tensor) for item in images):
+            raise ValueError("Image list items must be tensors")
+
+        first = images[0]
+        if first.ndim == 4 and first.shape[0] == 1:
+            return torch.cat(images, dim=0)
+        if first.ndim == 3:
+            return torch.stack(images, dim=0)
+        if first.ndim == 4:
+            return torch.cat(images, dim=0)
+        raise ValueError(f"Unsupported image list item shape: {tuple(first.shape)}")
+
+    def _masks_to_batch(self, masks):
+        import torch
+
+        if not masks:
+            return None
+        if not all(isinstance(item, torch.Tensor) for item in masks):
+            raise ValueError("Mask list items must be tensors")
+
+        normalized = []
+        for item in masks:
+            if item.ndim == 2:
+                normalized.append(item.unsqueeze(0))
+            elif item.ndim == 3:
+                normalized.append(item)
+            elif item.ndim == 4 and item.shape[-1] == 1:
+                normalized.append(item.squeeze(-1))
+            else:
+                raise ValueError(f"Unsupported mask list item shape: {tuple(item.shape)}")
+        return torch.cat(normalized, dim=0)
+
+    def _normalize_image(self, image):
+        if isinstance(image, (list, tuple)):
+            image = self._images_to_batch(image)
+
+        if image.ndim == 3:
+            image = image.unsqueeze(0)
+        elif image.ndim != 4:
+            raise ValueError(f"Unsupported image shape: {tuple(image.shape)}")
+
+        if image.shape[-1] < 3:
+            return image[..., :1].repeat_interleave(3, dim=-1)
+        return image[..., :3]
+
+    def _normalize_mask(self, mask, batch_size, height, width, device):
+        import torch
+        import torch.nn.functional as F
+
+        if mask is None:
+            return None
+        if isinstance(mask, (list, tuple)):
+            mask = self._masks_to_batch(mask)
+            if mask is None:
+                return None
+
+        if mask.ndim == 2:
+            mask = mask.unsqueeze(0)
+        elif mask.ndim == 4 and mask.shape[-1] == 1:
+            mask = mask.squeeze(-1)
+        elif mask.ndim != 3:
+            raise ValueError(f"Unsupported mask shape: {tuple(mask.shape)}")
+
+        mask = mask.to(device=device, dtype=torch.float32)
+        if mask.shape[-2] != height or mask.shape[-1] != width:
+            mask = F.interpolate(
+                mask.unsqueeze(1),
+                size=(height, width),
+                mode="nearest",
+            ).squeeze(1)
+
+        if mask.shape[0] == 1 and batch_size > 1:
+            mask = mask.repeat(batch_size, 1, 1)
+        elif mask.shape[0] != batch_size:
+            raise ValueError(
+                f"Mask batch size {mask.shape[0]} does not match image batch size {batch_size}"
+            )
+
+        return mask > 0.5
+
+    def dominant_color(self, image, mask=None):
+        import torch
+
+        rgb = self._normalize_image(image).detach()
+        device = rgb.device
+        batch_size, height, width = int(rgb.shape[0]), int(rgb.shape[1]), int(rgb.shape[2])
+        mask_bool = self._normalize_mask(mask, batch_size, height, width, device)
+
+        rgb_255 = (rgb.to(dtype=torch.float32).clamp(0.0, 1.0) * 255.0).round().to(dtype=torch.int64)
+        pixels = rgb_255.reshape(-1, 3)
+        if mask_bool is not None:
+            selected = mask_bool.reshape(-1)
+            if bool(selected.any()):
+                pixels = pixels[selected]
+
+        if pixels.numel() == 0:
+            return (0, 0, 0)
+
+        packed = (pixels[:, 0] << 16) + (pixels[:, 1] << 8) + pixels[:, 2]
+        values, counts = torch.unique(packed, return_counts=True)
+        color = int(values[torch.argmax(counts)].item())
+        red = (color >> 16) & 255
+        green = (color >> 8) & 255
+        blue = color & 255
+        return (red, green, blue)
+
+
 class maskFromBatch:
     @classmethod
     def INPUT_TYPES(s):
@@ -835,6 +964,7 @@ NODE_CLASS_MAPPINGS = {
     "logic resizeMask": resizeMask,
     "logic gaussianBlurMask": gaussianBlurMask,
     "logic imageColorToMask": imageColorToMask,
+    "logic dominantImageColor": dominantImageColor,
     "logic maskFromBatch": maskFromBatch,
 }
 
@@ -845,5 +975,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "logic resizeMask": "Resize Mask",
     "logic gaussianBlurMask": "Gaussian Blur Mask",
     "logic imageColorToMask": "Image Color to Mask",
+    "logic dominantImageColor": "Dominant Image Color",
     "logic maskFromBatch": "Get Mask from Batch",
 }
