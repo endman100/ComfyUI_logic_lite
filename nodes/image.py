@@ -957,7 +957,77 @@ class maskFromBatch:
         return (self._from_tensor_batch(mask, batch_index, length),)
 
 
+class emptyMask:
+    @classmethod
+    def INPUT_TYPES(s):
+        from nodes import MAX_RESOLUTION
+
+        return {
+            "required": {
+                "value": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "width": ("INT", {"default": 512, "min": 1, "max": MAX_RESOLUTION, "step": 1}),
+                "height": ("INT", {"default": 512, "min": 1, "max": MAX_RESOLUTION, "step": 1}),
+                "batch_size": ("INT", {"default": 1, "min": 1, "max": 4096}),
+            }
+        }
+
+    CATEGORY = "LogicLite/Logic/Image"
+    RETURN_TYPES = ("MASK",)
+    FUNCTION = "solid"
+
+    def solid(self, value, width, height, batch_size=1):
+        import torch
+        import comfy.model_management
+
+        mask = torch.full(
+            (batch_size, height, width), value,
+            dtype=torch.float32, device=comfy.model_management.intermediate_device(),
+        )
+        return (mask,)
+
+
+class repeatImage:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "amount": ("INT", {"default": 1, "min": 1, "max": 4096}),
+            }
+        }
+
+    CATEGORY = "LogicLite/Logic/Image"
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "repeat"
+
+    def repeat(self, image, amount=1):
+        return (image.repeat((amount, 1, 1, 1)),)
+
+
+class repeatMask:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "mask": ("MASK",),
+                "amount": ("INT", {"default": 1, "min": 1, "max": 4096}),
+            }
+        }
+
+    CATEGORY = "LogicLite/Logic/Image"
+    RETURN_TYPES = ("MASK",)
+    FUNCTION = "repeat"
+
+    def repeat(self, mask, amount=1):
+        if mask.ndim == 2:
+            mask = mask.unsqueeze(0)
+        return (mask.repeat((amount, 1, 1)),)
+
+
 NODE_CLASS_MAPPINGS = {
+    "logic repeatImage": repeatImage,
+    "logic repeatMask": repeatMask,
+    "logic emptyMask": emptyMask,
     "logic loadImageBatch": loadImageBatch,
     "logic imageListToImages": imageListToImages,
     "logic resizeImage": resizeImage,
@@ -969,6 +1039,9 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "logic repeatImage": "Repeat Image",
+    "logic repeatMask": "Repeat Mask",
+    "logic emptyMask": "Empty Mask",
     "logic loadImageBatch": "Load Image Batch",
     "logic imageListToImages": "Image List to Images",
     "logic resizeImage": "Resize Image",
