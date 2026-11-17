@@ -10,9 +10,9 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 MASK_NODES = {
-    "Video Mask Or (endman100)": "VideoMaskOr",
-    "Video Mask And (endman100)": "VideoMaskAnd",
-    "Video Mask Morphology (endman100)": "VideoMaskMorphology",
+    "Temporal Mask Or (endman100)": "TemporalMaskOr",
+    "Temporal Mask And (endman100)": "TemporalMaskAnd",
+    "Temporal Mask Morphology (endman100)": "TemporalMaskMorphology",
     "Mask Selection By Index (endman100)": "MaskSelectionByIndex",
     "Mask Selection Max Size (endman100)": "MaskSelectionMaxSize",
     "Mask Selection Min Size (endman100)": "MaskSelectionMinSize",
