@@ -18,7 +18,7 @@ stubs = {} if importlib.util.find_spec("cv2") else {"cv2": ModuleType("cv2")}
 with patch.dict(sys.modules, stubs):
     spec.loader.exec_module(mask)
 
-LOGIC_NODES = (mask.VideoMaskOr, mask.VideoMaskAnd)
+LOGIC_NODES = (mask.TemporalMaskOr, mask.TemporalMaskAnd)
 
 
 def invoke(node, *inputs, **options):
@@ -26,7 +26,7 @@ def invoke(node, *inputs, **options):
 
 
 def morphology(value, **options):
-    return mask.VideoMaskMorphology().morphology(value, **options)[0]
+    return mask.TemporalMaskMorphology().morphology(value, **options)[0]
 
 
 def reference_vote(value, radius, threshold):
@@ -65,45 +65,45 @@ class VideoLogicTests(unittest.TestCase):
             for count in (1, 2, 5):
                 inputs = [torch.rand((7, 3, 4), generator=generator) for _ in range(count)]
                 binary = torch.stack(inputs) > 0.5
-                expected = binary.any(0) if node is mask.VideoMaskOr else binary.all(0)
+                expected = binary.any(0) if node is mask.TemporalMaskOr else binary.all(0)
                 with self.subTest(node=node.__name__, count=count):
                     self.assert_output(invoke(node, *inputs), expected)
 
-    def test_temporal_radius_five_known_pattern_and_clipped_edges(self):
+    def test_radius_five_known_pattern_and_clipped_edges(self):
         # 13 個影格；前 6 格與末格為 1。首格 6/6，中央第 6 格 5/11，末格 1/6。
         source = torch.tensor([1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1]).reshape(13, 1, 1)
         averages = torch.tensor([6/6, 6/7, 6/8, 6/9, 6/10, 6/11, 5/11,
                                  5/11, 4/10, 3/9, 2/8, 1/7, 1/6]).reshape(13, 1, 1)
         for node in LOGIC_NODES:
             for threshold in (0.15, 0.5, 0.9):
-                result = invoke(node, source, temporal_radius=5, temporal_threshold=threshold)
+                result = invoke(node, source, radius=5, vote_threshold=threshold)
                 self.assert_output(result, averages > threshold)
-            self.assertEqual(invoke(node, source, temporal_radius=5)[0].item(), 1)
-            self.assertEqual(invoke(node, source, temporal_radius=5)[6].item(), 0)
-            self.assertEqual(invoke(node, source, temporal_radius=5, temporal_threshold=0.15)[-1].item(), 1)
+            self.assertEqual(invoke(node, source, radius=5)[0].item(), 1)
+            self.assertEqual(invoke(node, source, radius=5)[6].item(), 0)
+            self.assertEqual(invoke(node, source, radius=5, vote_threshold=0.15)[-1].item(), 1)
 
     def test_vote_follows_combine(self):
         first = torch.tensor([0, 1, 0, 1, 0], dtype=torch.float32).view(5, 1, 1)
         second = 1 - first
         for node in LOGIC_NODES:
-            expected = torch.ones_like(first) if node is mask.VideoMaskOr else torch.zeros_like(first)
-            self.assert_output(invoke(node, first, second, temporal_radius=1), expected)
+            expected = torch.ones_like(first) if node is mask.TemporalMaskOr else torch.zeros_like(first)
+            self.assert_output(invoke(node, first, second, radius=1), expected)
 
     def test_random_temporal_vote_matches_direct_reference(self):
         generator = torch.Generator(device="cpu").manual_seed(515)
         inputs = [torch.rand((19, 3, 5), generator=generator) for _ in range(3)]
         for node in LOGIC_NODES:
             stack = torch.stack(inputs) > 0.4
-            combined = stack.any(0) if node is mask.VideoMaskOr else stack.all(0)
+            combined = stack.any(0) if node is mask.TemporalMaskOr else stack.all(0)
             for radius in (1, 5, 100000000000000000000):
                 expected = reference_vote(combined, radius, 0.3)
-                result = invoke(node, *inputs, threshold=0.4, temporal_radius=radius, temporal_threshold=0.3)
+                result = invoke(node, *inputs, threshold=0.4, radius=radius, vote_threshold=0.3)
                 self.assert_output(result, expected)
 
     def test_radius_zero_skips_vote_even_at_threshold_one(self):
         source = torch.tensor([0.1, 0.5, 0.9], dtype=torch.float16).view(3, 1, 1)
         for node in LOGIC_NODES:
-            self.assert_output(invoke(node, source, temporal_radius=0, temporal_threshold=1), source > 0.5)
+            self.assert_output(invoke(node, source, radius=0, vote_threshold=1), source > 0.5)
 
     def test_shape_mismatch_t_h_w_reports_both_shapes(self):
         for node in LOGIC_NODES:
@@ -130,15 +130,15 @@ class VideoLogicTests(unittest.TestCase):
         first = torch.tensor([0.9, 0.1, 0.9, 0.1]).reshape(4, 1, 1)
         before = first.clone()
         for node in LOGIC_NODES:
-            normal = invoke(node, first, temporal_radius=1)
-            self.assert_output(invoke(node, first, temporal_radius=1, mask_inverse=True), 1 - normal)
+            normal = invoke(node, first, radius=1)
+            self.assert_output(invoke(node, first, radius=1, mask_inverse=True), 1 - normal)
             self.assertTrue(torch.equal(first, before))
 
-    def test_strict_temporal_threshold_boundary(self):
+    def test_strict_vote_threshold_boundary(self):
         source = torch.tensor([1., 0.]).reshape(2, 1, 1)
         for node in LOGIC_NODES:
-            self.assert_output(invoke(node, source, temporal_radius=5, temporal_threshold=0.5), torch.zeros_like(source))
-            self.assert_output(invoke(node, source, temporal_radius=5, temporal_threshold=0.49), torch.ones_like(source))
+            self.assert_output(invoke(node, source, radius=5, vote_threshold=0.5), torch.zeros_like(source))
+            self.assert_output(invoke(node, source, radius=5, vote_threshold=0.49), torch.ones_like(source))
 
     def test_dynamic_ports_allow_gaps_and_validate_names_and_values(self):
         source = torch.ones(2, 3, 4)
@@ -159,9 +159,9 @@ class VideoLogicTests(unittest.TestCase):
         source = torch.ones(2, 1, 1)
         for node in LOGIC_NODES:
             for radius in (-1, 1.5, True):
-                with self.assertRaisesRegex(ValueError, "temporal_radius"):
-                    invoke(node, source, temporal_radius=radius)
-            for name in ("threshold", "temporal_threshold"):
+                with self.assertRaisesRegex(ValueError, "radius"):
+                    invoke(node, source, radius=radius)
+            for name in ("threshold", "vote_threshold"):
                 for value in (-0.1, 1.1, float("nan"), float("inf")):
                     with self.assertRaisesRegex(ValueError, name):
                         invoke(node, source, **{name: value})
@@ -169,7 +169,7 @@ class VideoLogicTests(unittest.TestCase):
     def test_long_video_uses_prefix_sum_without_window_expansion(self):
         source = (torch.arange(10001) % 3 == 0).view(-1, 1, 1)
         for node in LOGIC_NODES:
-            result = invoke(node, source, temporal_radius=1000000, temporal_threshold=0.3)
+            result = invoke(node, source, radius=1000000, vote_threshold=0.3)
             self.assert_output(result, torch.ones_like(source))
 
 
@@ -189,27 +189,27 @@ class VideoMorphologyTests(unittest.TestCase):
         impulse[2, 2, 2] = 1
         cube = torch.zeros_like(impulse)
         cube[1:4, 1:4, 1:4] = 1
-        self.assertTrue(torch.equal(morphology(impulse, temporal_kernel_size=3), cube))
-        self.assertTrue(torch.equal(morphology(cube, method="erosion", temporal_kernel_size=3), impulse))
+        self.assertTrue(torch.equal(morphology(impulse, frame_kernel_size=3), cube))
+        self.assertTrue(torch.equal(morphology(cube, method="erosion", frame_kernel_size=3), impulse))
 
     def test_known_open_removes_speck_and_preserves_cube(self):
         cube = torch.zeros(7, 9, 9)
         cube[2:5, 3:6, 3:6] = 1
         source = cube.clone()
         source[0, 0, 0] = 1
-        self.assertTrue(torch.equal(morphology(source, method="open", temporal_kernel_size=3), cube))
+        self.assertTrue(torch.equal(morphology(source, method="open", frame_kernel_size=3), cube))
 
     def test_3d_close_bridges_exactly_one_missing_frame(self):
         # 5 個全白影格的中央影格全黑：[1,1,0,1,1]；時間核心 3 的 close 應補滿。
         source = torch.tensor([1., 1., 0., 1., 1.]).reshape(5, 1, 1).expand(5, 3, 3).clone()
-        self.assertTrue(torch.equal(morphology(source, method="close", temporal_kernel_size=3), torch.ones_like(source)))
-        self.assertTrue(torch.equal(morphology(source, method="close", temporal_kernel_size=1), source))
+        self.assertTrue(torch.equal(morphology(source, method="close", frame_kernel_size=3), torch.ones_like(source)))
+        self.assertTrue(torch.equal(morphology(source, method="close", frame_kernel_size=1), source))
 
     def test_uniform_volume_boundaries_do_not_change(self):
         for value in (0., 1.):
             source = torch.full((2, 3, 4), value)
             for method in ("erosion", "dilation", "open", "close"):
-                result = morphology(source, method=method, kernel_size=5, temporal_kernel_size=5)
+                result = morphology(source, method=method, kernel_size=5, frame_kernel_size=5)
                 self.assertTrue(torch.equal(result, source), (value, method))
 
     def test_first_last_frame_and_spatial_border_use_replicated_edges(self):
@@ -219,22 +219,22 @@ class VideoMorphologyTests(unittest.TestCase):
             source[frame, 0, 0] = 1
             expected = torch.zeros_like(source)
             expected[-2 if last else 0:None if last else 2, :2, :2] = 1
-            self.assertTrue(torch.equal(morphology(source, temporal_kernel_size=3), expected))
-            self.assertTrue(torch.equal(morphology(1 - source, method="erosion", temporal_kernel_size=3), 1 - expected))
+            self.assertTrue(torch.equal(morphology(source, frame_kernel_size=3), expected))
+            self.assertTrue(torch.equal(morphology(1 - source, method="erosion", frame_kernel_size=3), 1 - expected))
 
     def test_iterations_expand_dilation_and_erosion(self):
         source = torch.zeros(7, 7, 7)
         source[3, 3, 3] = 1
         expected = torch.zeros_like(source)
         expected[1:6, 1:6, 1:6] = 1
-        self.assertTrue(torch.equal(morphology(source, temporal_kernel_size=3, iterations=2), expected))
-        self.assertTrue(torch.equal(morphology(1 - source, method="erosion", temporal_kernel_size=3, iterations=2), 1 - expected))
+        self.assertTrue(torch.equal(morphology(source, frame_kernel_size=3, iterations=2), expected))
+        self.assertTrue(torch.equal(morphology(1 - source, method="erosion", frame_kernel_size=3, iterations=2), 1 - expected))
 
     def test_one_pool_call_per_morphology_stage_and_iteration(self):
         source = torch.zeros(3, 4, 5)
         for method, stages in (("dilation", 1), ("erosion", 1), ("open", 2), ("close", 2)):
             with patch.object(mask.F, "max_pool3d", wraps=F.max_pool3d) as pool:
-                morphology(source, method=method, temporal_kernel_size=3, iterations=2)
+                morphology(source, method=method, frame_kernel_size=3, iterations=2)
                 self.assertEqual(pool.call_count, stages * 2)
 
     def test_threshold_normalization_dtype_device_and_inverse(self):
@@ -248,12 +248,12 @@ class VideoMorphologyTests(unittest.TestCase):
         volume[1, 2, 2] = 1
         before = volume.clone()
         for method in ("erosion", "dilation", "open", "close"):
-            options = dict(method=method, temporal_kernel_size=3)
+            options = dict(method=method, frame_kernel_size=3)
             self.assertTrue(torch.equal(morphology(volume, **options, mask_inverse=True), 1 - morphology(volume, **options)))
         self.assertTrue(torch.equal(volume, before))
 
     def test_validates_odd_positive_kernels_and_iterations(self):
-        for name in ("kernel_size", "temporal_kernel_size"):
+        for name in ("kernel_size", "frame_kernel_size"):
             for value in (0, -1, 2, 4, 1.5, True):
                 with self.assertRaisesRegex(ValueError, name):
                     morphology(torch.ones(1, 1, 1), **{name: value})
@@ -265,15 +265,15 @@ class VideoMorphologyTests(unittest.TestCase):
                 morphology(torch.ones(1, 1, 1), **options)
 
     def test_single_input_contract_rejects_vote_or_extra_masks(self):
-        for name in ("mask2", "temporal_radius", "temporal_threshold"):
+        for name in ("mask2", "radius", "vote_threshold"):
             with self.assertRaises(TypeError):
                 morphology(torch.ones(1, 1, 1), **{name: 1})
 
 
 class VideoSchemaTests(unittest.TestCase):
     def test_registrations_and_defaults(self):
-        for title, node in (("Video Mask Or", mask.VideoMaskOr), ("Video Mask And", mask.VideoMaskAnd),
-                            ("Video Mask Morphology", mask.VideoMaskMorphology)):
+        for title, node in (("Temporal Mask Or", mask.TemporalMaskOr), ("Temporal Mask And", mask.TemporalMaskAnd),
+                            ("Temporal Mask Morphology", mask.TemporalMaskMorphology)):
             name = f"{title} (endman100)"
             self.assertIs(mask.NODE_CLASS_MAPPINGS[name], node)
             self.assertEqual(mask.NODE_DISPLAY_NAME_MAPPINGS[name], name)
@@ -284,11 +284,11 @@ class VideoSchemaTests(unittest.TestCase):
             schema = node.INPUT_TYPES()
             self.assertEqual(schema["optional"], {"mask2": ("MASK",)})
             defaults = {name: info[1]["default"] for name, info in schema["required"].items() if name != "mask1"}
-            self.assertEqual(defaults, dict(threshold=0.5, temporal_radius=0, temporal_threshold=0.5, mask_inverse=False))
-        schema = mask.VideoMaskMorphology.INPUT_TYPES()
+            self.assertEqual(defaults, dict(threshold=0.5, radius=0, vote_threshold=0.5, mask_inverse=False))
+        schema = mask.TemporalMaskMorphology.INPUT_TYPES()
         self.assertNotIn("optional", schema)
         defaults = {name: info[1]["default"] for name, info in schema["required"].items() if name != "mask"}
-        self.assertEqual(defaults, dict(method="dilation", kernel_size=3, temporal_kernel_size=1,
+        self.assertEqual(defaults, dict(method="dilation", kernel_size=3, frame_kernel_size=1,
                                         kernel_shape="rect", iterations=1, threshold=0.5, mask_inverse=False))
 
 

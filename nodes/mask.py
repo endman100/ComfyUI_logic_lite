@@ -1098,9 +1098,9 @@ def _stack_video_masks(mask1, mask2, kwargs):
     return torch.stack(masks, dim=0)
 
 
-def _video_temporal_vote(binary, temporal_radius, temporal_threshold):
-    radius = _video_int(temporal_radius, "temporal_radius")
-    threshold = _video_threshold(temporal_threshold, "temporal_threshold")
+def _video_temporal_vote(binary, radius, vote_threshold):
+    radius = _video_int(radius, "radius")
+    threshold = _video_threshold(vote_threshold, "vote_threshold")
     result = binary.to(torch.float32)
     if radius == 0:
         return result
@@ -1115,15 +1115,15 @@ def _video_temporal_vote(binary, temporal_radius, temporal_threshold):
     return (averages > threshold).to(torch.float32)
 
 
-class VideoMaskOr:
+class TemporalMaskOr:
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
                 "mask1": ("MASK",),
                 "threshold": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "temporal_radius": ("INT", {"default": 0, "min": 0}),
-                "temporal_threshold": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "radius": ("INT", {"default": 0, "min": 0}),
+                "vote_threshold": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "mask_inverse": ("BOOLEAN", {"default": False}),
             },
             "optional": {"mask2": ("MASK",)},
@@ -1138,29 +1138,29 @@ class VideoMaskOr:
     def _reduce(self, binary):
         return binary.any(dim=0)
 
-    def combine(self, mask1, mask2=None, threshold=0.5, temporal_radius=0,
-                temporal_threshold=0.5, mask_inverse=False, **kwargs):
+    def combine(self, mask1, mask2=None, threshold=0.5, radius=0,
+                vote_threshold=0.5, mask_inverse=False, **kwargs):
         threshold = _video_threshold(threshold, "threshold")
         binary = self._reduce(_stack_video_masks(mask1, mask2, kwargs) > threshold)
-        result = _video_temporal_vote(binary, temporal_radius, temporal_threshold)
+        result = _video_temporal_vote(binary, radius, vote_threshold)
         return (_invert_mask_output(result, mask_inverse),)
 
 
-class VideoMaskAnd(VideoMaskOr):
+class TemporalMaskAnd(TemporalMaskOr):
     DESCRIPTION = "逐影格二值化並取交集，再對時間鄰域平均值取嚴格大於門檻的結果；最後可反相。"
 
     def _reduce(self, binary):
         return binary.all(dim=0)
 
 
-class VideoMaskMorphology:
+class TemporalMaskMorphology:
     @classmethod
     def INPUT_TYPES(cls):
         return {"required": {
             "mask": ("MASK",),
             "method": (["erosion", "dilation", "open", "close"], {"default": "dilation"}),
             "kernel_size": ("INT", {"default": 3, "min": 1, "step": 2}),
-            "temporal_kernel_size": ("INT", {"default": 1, "min": 1, "step": 2}),
+            "frame_kernel_size": ("INT", {"default": 1, "min": 1, "step": 2}),
             "kernel_shape": (["rect"], {"default": "rect"}),
             "iterations": ("INT", {"default": 1, "min": 1}),
             "threshold": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
@@ -1181,10 +1181,10 @@ class VideoMaskMorphology:
     def _erosion(cls, volume, kernel, padding):
         return -cls._dilation(-volume, kernel, padding)
 
-    def morphology(self, mask, method="dilation", kernel_size=3, temporal_kernel_size=1,
+    def morphology(self, mask, method="dilation", kernel_size=3, frame_kernel_size=1,
                    kernel_shape="rect", iterations=1, threshold=0.5, mask_inverse=False):
         spatial = _video_int(kernel_size, "kernel_size", minimum=1, odd=True)
-        temporal = _video_int(temporal_kernel_size, "temporal_kernel_size", minimum=1, odd=True)
+        temporal = _video_int(frame_kernel_size, "frame_kernel_size", minimum=1, odd=True)
         iterations = _video_int(iterations, "iterations", minimum=1)
         threshold = _video_threshold(threshold, "threshold")
         if method not in ("erosion", "dilation", "open", "close"):
@@ -1208,9 +1208,9 @@ class VideoMaskMorphology:
 
 
 NODE_CLASS_MAPPINGS = {
-    "Video Mask Or (endman100)": VideoMaskOr,
-    "Video Mask And (endman100)": VideoMaskAnd,
-    "Video Mask Morphology (endman100)": VideoMaskMorphology,
+    "Temporal Mask Or (endman100)": TemporalMaskOr,
+    "Temporal Mask And (endman100)": TemporalMaskAnd,
+    "Temporal Mask Morphology (endman100)": TemporalMaskMorphology,
     "Mask Selection By Index (endman100)": MaskSelectionByIndex,
     "Mask Selection Max Size (endman100)": MaskSelectionMaxSize,
     "Mask Selection Min Size (endman100)": MaskSelectionMinSize,
@@ -1231,9 +1231,9 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "Video Mask Or (endman100)": "Video Mask Or (endman100)",
-    "Video Mask And (endman100)": "Video Mask And (endman100)",
-    "Video Mask Morphology (endman100)": "Video Mask Morphology (endman100)",
+    "Temporal Mask Or (endman100)": "Temporal Mask Or (endman100)",
+    "Temporal Mask And (endman100)": "Temporal Mask And (endman100)",
+    "Temporal Mask Morphology (endman100)": "Temporal Mask Morphology (endman100)",
     "Mask Selection By Index (endman100)": "Mask Selection By Index (endman100)",
     "Mask Selection Max Size (endman100)": "Mask Selection Max Size (endman100)",
     "Mask Selection Min Size (endman100)": "Mask Selection Min Size (endman100)",

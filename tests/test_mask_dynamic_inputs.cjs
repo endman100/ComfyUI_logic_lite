@@ -8,7 +8,7 @@ const file = path.join(__dirname, "../web_version/v2/mask_and_mask_dynamic_input
 const source = fs.readFileSync(file, "utf8");
 const importLine = 'import { app } from "../../scripts/app.js";';
 assert.ok(source.startsWith(importLine), "Use the public app module, without requiring window.comfyAPI");
-const names = ["Mask Or Mask", "Mask And Mask", "Mask Sub Mask", "Mask Concat", "Video Mask Or", "Video Mask And"]
+const names = ["Mask Or Mask", "Mask And Mask", "Mask Sub Mask", "Mask Concat", "Temporal Mask Or", "Temporal Mask And"]
     .map(name => `${name} (endman100)`);
 
 async function fixture(name = names[0]) {
@@ -204,6 +204,6 @@ test("unrelated nodes are not wrapped", async () => {
 });
 
 test("影片形態學節點維持單一輸入，不套用動態接頭", async () => {
-    const {Node, originalCreated} = await fixture("Video Mask Morphology (endman100)");
+    const {Node, originalCreated} = await fixture("Temporal Mask Morphology (endman100)");
     assert.strictEqual(Node.prototype.onNodeCreated, originalCreated);
 });
