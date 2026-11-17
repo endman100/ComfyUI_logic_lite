@@ -262,7 +262,7 @@ class LongConcatTests(unittest.TestCase):
         self.assertEqual(list(schema["required"]), ["mask1", "downscale_resize"])
         self.assertNotIn("merge_all", schema["required"] | schema["optional"])
         self.assertIs(mask.NODE_CLASS_MAPPINGS["Mask Concat (endman100)"], mask.MaskConcatLongImage)
-        self.assertEqual(len(mask.NODE_CLASS_MAPPINGS), 17)
+        self.assertEqual(len(mask.NODE_CLASS_MAPPINGS), 20)
 
 
 if __name__ == "__main__":
