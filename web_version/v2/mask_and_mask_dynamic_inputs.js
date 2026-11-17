@@ -5,6 +5,8 @@ const NODE_NAMES = new Set([
     "Mask And Mask (endman100)",
     "Mask Sub Mask (endman100)",
     "Mask Concat (endman100)",
+    "Video Mask Or (endman100)",
+    "Video Mask And (endman100)",
 ]);
 const MASK_INPUT_RE = /^mask[1-9]\d*$/;
 

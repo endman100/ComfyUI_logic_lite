@@ -10,6 +10,9 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 MASK_NODES = {
+    "Video Mask Or (endman100)": "VideoMaskOr",
+    "Video Mask And (endman100)": "VideoMaskAnd",
+    "Video Mask Morphology (endman100)": "VideoMaskMorphology",
     "Mask Selection By Index (endman100)": "MaskSelectionByIndex",
     "Mask Selection Max Size (endman100)": "MaskSelectionMaxSize",
     "Mask Selection Min Size (endman100)": "MaskSelectionMinSize",
@@ -73,7 +76,7 @@ class MaskRegistrationTests(unittest.TestCase):
             {key: cls.__name__ for key, cls in package._MASK_CLASS.items()},
             MASK_NODES,
         )
-        self.assertEqual(len(package.NODE_CLASS_MAPPINGS), 63 + 17)
+        self.assertEqual(len(package.NODE_CLASS_MAPPINGS), 63 + 20)
         self.assertEqual(package.NODE_CLASS_MAPPINGS, {**original, **package._MASK_CLASS})
         for key in MASK_NODES:
             node = package.NODE_CLASS_MAPPINGS[key]

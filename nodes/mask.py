@@ -1032,7 +1032,185 @@ class MaskToRegion():
         return (w, h, x, y, image)
 
 
+def _video_int(value, name, minimum=0, odd=False):
+    if (isinstance(value, bool) or not isinstance(value, (int, np.integer))
+            or value < minimum or (odd and value % 2 == 0)):
+        rule = "正奇數" if odd else f"大於或等於 {minimum} 的整數"
+        raise ValueError(f"{name} 必須是{rule}；收到 {value!r}")
+    return int(value)
+
+
+def _video_threshold(value, name):
+    if not isinstance(value, (int, float, np.number)) or not np.isfinite(value) or not 0 <= value <= 1:
+        raise ValueError(f"{name} 必須是 0 到 1 之間的有限數值；收到 {value!r}")
+    return value
+
+
+def _normalize_video_mask(mask, name="mask"):
+    """將張量或清單轉成 [T,H,W]，不改變裝置或影像尺寸。"""
+    if isinstance(mask, list):
+        if not mask:
+            raise ValueError(f"{name} 清單不可為空")
+        if isinstance(mask[0], torch.Tensor):
+            # 清單元素可能各自包含多個影格；只逐項正規化，不逐影格運算。
+            items = [_normalize_video_mask(item, f"{name}[{i}]") for i, item in enumerate(mask)]
+            if any(item.shape[1:] != items[0].shape[1:] for item in items):
+                raise ValueError(f"{name} 清單元素必須具有相同 H,W")
+            if any(item.device != items[0].device for item in items):
+                raise ValueError(f"{name} 清單元素必須位於相同裝置")
+            return torch.cat(items, dim=0)
+        try:
+            mask = torch.as_tensor(mask)
+        except (TypeError, ValueError, RuntimeError) as error:
+            raise ValueError(f"{name} 必須是規則的數值清單或遮罩張量清單") from error
+    if not isinstance(mask, torch.Tensor):
+        raise TypeError(f"{name} 必須是張量或清單；收到 {type(mask).__name__}")
+    if mask.ndim == 2:
+        mask = mask.unsqueeze(0)
+    elif mask.ndim == 4 and mask.shape[-1] == 1:
+        mask = mask.squeeze(-1)
+    if mask.ndim != 3 or any(size == 0 for size in mask.shape):
+        raise ValueError(f"{name} 必須是非空的 [H,W]、[T,H,W] 或 [T,H,W,1]；收到 {tuple(mask.shape)}")
+    if mask.is_complex():
+        raise TypeError(f"{name} 必須包含實數遮罩值")
+    return mask
+
+
+def _stack_video_masks(mask1, mask2, kwargs):
+    if mask1 is None:
+        raise ValueError("mask1 為必填，請至少連接一個遮罩")
+    # 動態輸入需要逐接頭驗證；像素運算統一在 stack 後執行。
+    for name in kwargs:
+        suffix = name[4:] if name.startswith("mask") else ""
+        if not suffix.isascii() or not suffix.isdigit() or int(suffix) < 3 or name != f"mask{int(suffix)}":
+            raise ValueError(f"不支援的參數 {name!r}；額外輸入必須命名為 mask3、mask4 等")
+    named = {"mask1": mask1}
+    if mask2 is not None:
+        named["mask2"] = mask2
+    named.update(kwargs)
+    masks = [_normalize_video_mask(value, name) for name, value in named.items()]
+    first = masks[0]
+    for name, value in zip(named, masks):
+        if value.shape != first.shape:
+            raise ValueError(f"所有輸入必須具有相同 T,H,W；mask1={tuple(first.shape)}，{name}={tuple(value.shape)}")
+        if value.device != first.device:
+            raise ValueError(f"所有輸入必須位於相同裝置；mask1={first.device}，{name}={value.device}")
+    return torch.stack(masks, dim=0)
+
+
+def _video_temporal_vote(binary, temporal_radius, temporal_threshold):
+    radius = _video_int(temporal_radius, "temporal_radius")
+    threshold = _video_threshold(temporal_threshold, "temporal_threshold")
+    result = binary.to(torch.float32)
+    if radius == 0:
+        return result
+    length = result.shape[0]
+    radius = min(radius, length - 1)
+    indices = torch.arange(length, device=result.device)
+    starts = (indices - radius).clamp(min=0)
+    ends = (indices + radius + 1).clamp(max=length)
+    # 前綴和只沿 T 配置線性空間，邊界除以實際可用影格數。
+    prefix = F.pad(result.cumsum(dim=0), (0, 0, 0, 0, 1, 0))
+    averages = (prefix[ends] - prefix[starts]) / (ends - starts).view(-1, 1, 1)
+    return (averages > threshold).to(torch.float32)
+
+
+class VideoMaskOr:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "mask1": ("MASK",),
+                "threshold": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "temporal_radius": ("INT", {"default": 0, "min": 0}),
+                "temporal_threshold": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "mask_inverse": ("BOOLEAN", {"default": False}),
+            },
+            "optional": {"mask2": ("MASK",)},
+        }
+
+    RETURN_TYPES = ("MASK",)
+    RETURN_NAMES = ("mask",)
+    FUNCTION = "combine"
+    CATEGORY = "mask/video"
+    DESCRIPTION = "逐影格二值化並取聯集，再對時間鄰域平均值取嚴格大於門檻的結果；最後可反相。"
+
+    def _reduce(self, binary):
+        return binary.any(dim=0)
+
+    def combine(self, mask1, mask2=None, threshold=0.5, temporal_radius=0,
+                temporal_threshold=0.5, mask_inverse=False, **kwargs):
+        threshold = _video_threshold(threshold, "threshold")
+        binary = self._reduce(_stack_video_masks(mask1, mask2, kwargs) > threshold)
+        result = _video_temporal_vote(binary, temporal_radius, temporal_threshold)
+        return (_invert_mask_output(result, mask_inverse),)
+
+
+class VideoMaskAnd(VideoMaskOr):
+    DESCRIPTION = "逐影格二值化並取交集，再對時間鄰域平均值取嚴格大於門檻的結果；最後可反相。"
+
+    def _reduce(self, binary):
+        return binary.all(dim=0)
+
+
+class VideoMaskMorphology:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "mask": ("MASK",),
+            "method": (["erosion", "dilation", "open", "close"], {"default": "dilation"}),
+            "kernel_size": ("INT", {"default": 3, "min": 1, "step": 2}),
+            "temporal_kernel_size": ("INT", {"default": 1, "min": 1, "step": 2}),
+            "kernel_shape": (["rect"], {"default": "rect"}),
+            "iterations": ("INT", {"default": 1, "min": 1}),
+            "threshold": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
+            "mask_inverse": ("BOOLEAN", {"default": False}),
+        }}
+
+    RETURN_TYPES = ("MASK",)
+    RETURN_NAMES = ("mask",)
+    FUNCTION = "morphology"
+    CATEGORY = "mask/video"
+    DESCRIPTION = "單一影片遮罩的真正 3D 矩形核心形態學；時間核心 1 表示僅處理空間，邊界複製填補，最後可反相。"
+
+    @staticmethod
+    def _dilation(volume, kernel, padding):
+        return F.max_pool3d(F.pad(volume, padding, mode="replicate"), kernel, stride=1)
+
+    @classmethod
+    def _erosion(cls, volume, kernel, padding):
+        return -cls._dilation(-volume, kernel, padding)
+
+    def morphology(self, mask, method="dilation", kernel_size=3, temporal_kernel_size=1,
+                   kernel_shape="rect", iterations=1, threshold=0.5, mask_inverse=False):
+        spatial = _video_int(kernel_size, "kernel_size", minimum=1, odd=True)
+        temporal = _video_int(temporal_kernel_size, "temporal_kernel_size", minimum=1, odd=True)
+        iterations = _video_int(iterations, "iterations", minimum=1)
+        threshold = _video_threshold(threshold, "threshold")
+        if method not in ("erosion", "dilation", "open", "close"):
+            raise ValueError(f"不支援的 method：{method!r}")
+        if kernel_shape != "rect":
+            raise ValueError(f"kernel_shape 僅支援 rect；收到 {kernel_shape!r}")
+        volume = (_normalize_video_mask(mask) > threshold).to(torch.float32)[None, None]
+        kernel = (temporal, spatial, spatial)
+        padding = (spatial // 2, spatial // 2, spatial // 2, spatial // 2, temporal // 2, temporal // 2)
+        # open/close 的 iterations 分別套用於各階段，與慣用形態學定義一致。
+        if method in ("erosion", "open"):
+            for _ in range(iterations):
+                volume = self._erosion(volume, kernel, padding)
+        if method in ("dilation", "open", "close"):
+            for _ in range(iterations):
+                volume = self._dilation(volume, kernel, padding)
+        if method == "close":
+            for _ in range(iterations):
+                volume = self._erosion(volume, kernel, padding)
+        return (_invert_mask_output(volume[0, 0], mask_inverse),)
+
+
 NODE_CLASS_MAPPINGS = {
+    "Video Mask Or (endman100)": VideoMaskOr,
+    "Video Mask And (endman100)": VideoMaskAnd,
+    "Video Mask Morphology (endman100)": VideoMaskMorphology,
     "Mask Selection By Index (endman100)": MaskSelectionByIndex,
     "Mask Selection Max Size (endman100)": MaskSelectionMaxSize,
     "Mask Selection Min Size (endman100)": MaskSelectionMinSize,
@@ -1053,6 +1231,9 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "Video Mask Or (endman100)": "Video Mask Or (endman100)",
+    "Video Mask And (endman100)": "Video Mask And (endman100)",
+    "Video Mask Morphology (endman100)": "Video Mask Morphology (endman100)",
     "Mask Selection By Index (endman100)": "Mask Selection By Index (endman100)",
     "Mask Selection Max Size (endman100)": "Mask Selection Max Size (endman100)",
     "Mask Selection Min Size (endman100)": "Mask Selection Min Size (endman100)",

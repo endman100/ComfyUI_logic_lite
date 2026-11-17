@@ -8,7 +8,7 @@ const file = path.join(__dirname, "../web_version/v2/mask_and_mask_dynamic_input
 const source = fs.readFileSync(file, "utf8");
 const importLine = 'import { app } from "../../scripts/app.js";';
 assert.ok(source.startsWith(importLine), "Use the public app module, without requiring window.comfyAPI");
-const names = ["Mask Or Mask", "Mask And Mask", "Mask Sub Mask", "Mask Concat"]
+const names = ["Mask Or Mask", "Mask And Mask", "Mask Sub Mask", "Mask Concat", "Video Mask Or", "Video Mask And"]
     .map(name => `${name} (endman100)`);
 
 async function fixture(name = names[0]) {
@@ -65,7 +65,7 @@ async function fixture(name = names[0]) {
 
 const slots = node => node.inputs.filter(input => input.type === "MASK").map(input => input.name);
 
-test("all four registered nodes start with mask1 only and grow to N", async () => {
+test("六種節點皆從 mask1 開始，連接後可擴充至 N 個輸入", async () => {
     for (const name of names) {
         const {node, connect, flush} = await fixture(name);
         assert.equal(node.onNodeCreated("argument"), "created-result");
@@ -200,5 +200,10 @@ test("output connection events leave inputs untouched", async () => {
 
 test("unrelated nodes are not wrapped", async () => {
     const {Node, originalCreated} = await fixture("logic repeatMask");
+    assert.strictEqual(Node.prototype.onNodeCreated, originalCreated);
+});
+
+test("影片形態學節點維持單一輸入，不套用動態接頭", async () => {
+    const {Node, originalCreated} = await fixture("Video Mask Morphology (endman100)");
     assert.strictEqual(Node.prototype.onNodeCreated, originalCreated);
 });
