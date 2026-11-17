@@ -76,8 +76,8 @@ class MaskRegistrationTests(unittest.TestCase):
             {key: cls.__name__ for key, cls in package._MASK_CLASS.items()},
             MASK_NODES,
         )
-        self.assertEqual(len(package.NODE_CLASS_MAPPINGS), 63 + 20)
-        self.assertEqual(package.NODE_CLASS_MAPPINGS, {**original, **package._MASK_CLASS})
+        self.assertEqual(len(package.NODE_CLASS_MAPPINGS), 63 + 20 + 2)
+        self.assertEqual(package.NODE_CLASS_MAPPINGS, {**original, **package._MASK_CLASS, **package._VIDEO_IO_CLASS})
         for key in MASK_NODES:
             node = package.NODE_CLASS_MAPPINGS[key]
             self.assertIsInstance(node.INPUT_TYPES(), dict)
@@ -91,6 +91,7 @@ class MaskRegistrationTests(unittest.TestCase):
             **package._IMAGE_DISPLAY,
             **package._LORA_UTIL_DISPLAY,
             **package._MASK_DISPLAY,
+            **package._VIDEO_IO_DISPLAY,
         })
         self.assertEqual(
             package.NODE_DISPLAY_NAME_MAPPINGS.keys(), package.NODE_CLASS_MAPPINGS.keys(),

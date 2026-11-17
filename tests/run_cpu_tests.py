@@ -11,6 +11,8 @@ OpenCV is not needed by the four mask operations under test.
 
 import argparse
 import ast
+import importlib.util
+import os
 from pathlib import Path
 import sys
 from types import ModuleType, SimpleNamespace
@@ -77,6 +79,11 @@ def main():
     options = parser.parse_args()
     install_core_references(options.comfy_root)
     print(f"PyTorch {torch.__version__}; CUDA build: {torch.version.cuda}; CPU only", flush=True)
+    # 先載入原生 OpenCV，避免其他測試的 sys.modules 隔離導致反覆初始化原生子模組。
+    if importlib.util.find_spec("cv2") is not None:
+        os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
+        import cv2
+        print(f"OpenCV {cv2.__version__}: {cv2.__file__}", flush=True)
     suite = unittest.defaultTestLoader.discover(str(Path(__file__).parent), pattern="test_*.py")
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     return 0 if result.wasSuccessful() else 1
