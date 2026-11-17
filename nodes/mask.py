@@ -211,30 +211,59 @@ class MaskSelectionMaxCountours:
         return (_invert_mask_output(result, mask_inverse),)
 
 def _collect_numbered_masks(mask1, mask2, kwargs):
-    masks = [mask1, mask2]
+    if mask1 is None:
+        raise ValueError("mask1 is required; connect at least one mask")
+    masks = [("mask1", mask1)]
+    if mask2 is not None:
+        masks.append(("mask2", mask2))
     extra_mask_names = [
         name for name in kwargs
         if name.startswith("mask") and name[4:].isdigit() and int(name[4:]) > 2
     ]
     for name in sorted(extra_mask_names, key=lambda item: int(item[4:])):
-        masks.append(kwargs[name])
-    return masks
+        masks.append((name, kwargs[name]))
+    return [_normalize_mask_sequence(mask, name) for name, mask in masks]
 
 
-def _normalize_mask_tensor(mask):
+def _normalize_mask_tensor(mask, name="mask"):
+    if not isinstance(mask, torch.Tensor):
+        raise TypeError(f"{name} must be a tensor, got {type(mask).__name__}")
     if mask.dim() == 2:
         mask = mask.unsqueeze(0)
+    elif mask.dim() == 4 and mask.shape[-1] == 1:
+        mask = mask.squeeze(-1)
     if mask.dim() != 3:
-        raise ValueError("mask tensor must be 2D or 3D", mask.shape, type(mask))
+        raise ValueError(f"{name} must have shape [H,W], [B,H,W], or [B,H,W,1]; got {tuple(mask.shape)}")
+    if any(size == 0 for size in mask.shape):
+        raise ValueError(f"{name} must have a non-empty batch and positive height/width; got {tuple(mask.shape)}")
+    if mask.is_complex():
+        raise TypeError(f"{name} must contain real mask values")
     return mask
 
 
 def _combine_mask_tensors(masks, operation, merge_all, threshold):
-    normalized_masks = [_normalize_mask_tensor(mask) for mask in masks]
-    original_dtype = normalized_masks[0].dtype
-    result = normalized_masks[0] > threshold
-    for mask in normalized_masks[1:]:
-        mask_bool = mask > threshold
+    first = masks[0]
+    if any(mask.shape[1:] != first.shape[1:] for mask in masks):
+        raise ValueError("all mask inputs must have the same height and width", [tuple(mask.shape) for mask in masks])
+    if not merge_all and any(mask.shape[0] != first.shape[0] for mask in masks):
+        raise ValueError("all mask inputs must have the same batch size when merge_all=False; broadcasting is not allowed",
+                         [mask.shape[0] for mask in masks])
+
+    result = first > threshold
+    if merge_all:
+        if operation == "or":
+            result = result.any(dim=0, keepdim=True)
+        elif operation == "and":
+            result = result.all(dim=0, keepdim=True)
+        elif operation == "sub":
+            # Flat order is mask1's entire batch, then mask2's batch, etc.
+            result = result[:1] & ~result[1:].any(dim=0, keepdim=True)
+
+    for mask in masks[1:]:
+        mask_bool = mask.to(device=first.device) > threshold
+        if merge_all:
+            mask_bool = (mask_bool.all(dim=0, keepdim=True) if operation == "and"
+                         else mask_bool.any(dim=0, keepdim=True))
         if operation == "or":
             result = torch.logical_or(result, mask_bool)
         elif operation == "and":
@@ -244,69 +273,27 @@ def _combine_mask_tensors(masks, operation, merge_all, threshold):
         else:
             raise ValueError("unknown mask operation", operation)
 
-    if merge_all:
-        if operation == "or":
-            result = torch.any(result, dim=0).unsqueeze(0)
-        else:
-            result = torch.all(result, dim=0)
-    return result.to(original_dtype)
-
-
-def _combine_mask_lists(masks, operation, merge_all, threshold):
-    result = []
-    for mask_group in zip(*masks):
-        original_dtype = mask_group[0].dtype
-        _result = mask_group[0] > threshold
-        for _mask in mask_group[1:]:
-            mask_bool = _mask > threshold
-            if operation == "or":
-                _result = torch.logical_or(_result, mask_bool)
-            elif operation == "and":
-                _result = torch.logical_and(_result, mask_bool)
-            elif operation == "sub":
-                _result = torch.logical_and(_result, ~mask_bool)
-            else:
-                raise ValueError("unknown mask operation", operation)
-        result.append((_result, original_dtype))
-
-    if merge_all:
-        if operation == "or":
-            result = [(torch.any(_result, dim=0), original_dtype) for _result, original_dtype in result]
-        else:
-            result = [(torch.all(_result, dim=0), original_dtype) for _result, original_dtype in result]
-    return [_result.to(original_dtype) for _result, original_dtype in result]
+    return result.to(first.dtype)
 
 
 def _combine_numbered_masks(mask1, mask2, merge_all, operation, mask_inverse, threshold, kwargs):
     masks = _collect_numbered_masks(mask1, mask2, kwargs)
 
-    if all(isinstance(mask, torch.Tensor) for mask in masks):
-        result = _combine_mask_tensors(masks, operation, merge_all, threshold)
-    elif all(isinstance(mask, list) for mask in masks):
-        result = _combine_mask_lists(masks, operation, merge_all, threshold)
-    else:
-        raise ValueError("masks must all be lists or tensors", [type(mask) for mask in masks])
+    result = _combine_mask_tensors(masks, operation, merge_all, threshold)
     return (_invert_mask_output(result, mask_inverse),)
 
 
-def _normalize_mask_sequence(mask):
-    if isinstance(mask, torch.Tensor):
-        mask = mask.clone()
-    elif isinstance(mask, list):
-        if len(mask) == 0:
-            raise ValueError("mask list must not be empty")
-        mask = torch.stack([_mask.clone() for _mask in mask])
-    else:
-        raise ValueError("mask must be list or tensor", getattr(mask, "shape", None), type(mask))
-
-    if mask.dim() == 2:
-        mask = mask.unsqueeze(0)
-    elif mask.dim() == 4 and mask.shape[-1] == 1:
-        mask = mask.squeeze(-1)
-
-    if mask.dim() != 3:
-        raise ValueError("mask sequence must have shape [T,H,W], [H,W], or [T,H,W,1]", mask.shape)
-    return mask
+def _normalize_mask_sequence(mask, name="mask"):
+    """Normalize tensor/list batches without truncation or spatial broadcasting."""
+    if not isinstance(mask, list):
+        return _normalize_mask_tensor(mask, name)
+    if not mask:
+        raise ValueError(f"{name} list must not be empty")
+    items = [_normalize_mask_tensor(item, f"{name}[{index}]") for index, item in enumerate(mask)]
+    first = items[0]
+    if any(item.shape[1:] != first.shape[1:] for item in items):
+        raise ValueError(f"{name} list items must have the same height and width", [tuple(item.shape) for item in items])
+    return torch.cat([item.to(device=first.device) for item in items], dim=0)
 
 
 class MaskConcatLongImage:
@@ -318,9 +305,9 @@ class MaskConcatLongImage:
         return {
             "required": {
                 "mask1": ("MASK",),
-                "mask2": ("MASK",),
                 "downscale_resize": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 1.0, "step": 0.01}),
             },
+            "optional": {"mask2": ("MASK",)},
         }
 
     RETURN_TYPES = ("MASK", "IMAGE")
@@ -339,16 +326,16 @@ class MaskConcatLongImage:
         mask = F.interpolate(mask, size=(target_h, target_w), mode="nearest")
         return mask.squeeze(1)
 
-    def method(self, mask1, mask2, downscale_resize=1.0, **kwargs):
+    def method(self, mask1, mask2=None, downscale_resize=1.0, **kwargs):
         downscale_resize = float(downscale_resize)
-        if downscale_resize <= 0.0 or downscale_resize > 1.0:
+        if not 0.0 < downscale_resize <= 1.0:
             raise ValueError("downscale_resize must be greater than 0.0 and less than or equal to 1.0", downscale_resize)
 
-        masks = [_normalize_mask_sequence(mask) for mask in _collect_numbered_masks(mask1, mask2, kwargs)]
+        masks = _collect_numbered_masks(mask1, mask2, kwargs)
         first_length = masks[0].shape[0]
         lengths = [mask.shape[0] for mask in masks]
         if any(length != first_length for length in lengths):
-            raise ValueError("all mask inputs must have the same temporal length", lengths)
+            raise ValueError("all mask inputs must have the same batch size (temporal length)", lengths)
 
         device = masks[0].device
         resized_masks = [
@@ -374,11 +361,11 @@ class MaskOrMask:
         return {
             "required": {
                 "mask1": ("MASK",),
-                "mask2": ("MASK",),
                 "merge_all": ("BOOLEAN", {"default": False}),
                 "mask_inverse": ("BOOLEAN", {"default": False}),
                 "threshold": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
             },
+            "optional": {"mask2": ("MASK",)},
         }
 
     RETURN_TYPES = ("MASK",)
@@ -386,7 +373,7 @@ class MaskOrMask:
     FUNCTION = "method"
     CATEGORY = "mask"
 
-    def method(self, mask1, mask2, merge_all, mask_inverse=False, threshold=0.5, **kwargs):
+    def method(self, mask1, mask2=None, merge_all=False, mask_inverse=False, threshold=0.5, **kwargs):
         return _combine_numbered_masks(mask1, mask2, merge_all, "or", mask_inverse, threshold, kwargs)
 
 class MaskAndMask:
@@ -398,11 +385,11 @@ class MaskAndMask:
         return {
             "required": {
                 "mask1": ("MASK",),
-                "mask2": ("MASK",),
                 "merge_all": ("BOOLEAN", {"default": False}),
                 "mask_inverse": ("BOOLEAN", {"default": False}),
                 "threshold": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
             },
+            "optional": {"mask2": ("MASK",)},
         }
 
     RETURN_TYPES = ("MASK",)
@@ -410,7 +397,7 @@ class MaskAndMask:
     FUNCTION = "method"
     CATEGORY = "mask"
 
-    def method(self, mask1, mask2, merge_all, mask_inverse=False, threshold=0.5, **kwargs):
+    def method(self, mask1, mask2=None, merge_all=False, mask_inverse=False, threshold=0.5, **kwargs):
         return _combine_numbered_masks(mask1, mask2, merge_all, "and", mask_inverse, threshold, kwargs)
 
 
@@ -423,11 +410,11 @@ class MaskSubMask:
         return {
             "required": {
                 "mask1": ("MASK",),
-                "mask2": ("MASK",),
                 "merge_all": ("BOOLEAN", {"default": False}),
                 "mask_inverse": ("BOOLEAN", {"default": False}),
                 "threshold": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
             },
+            "optional": {"mask2": ("MASK",)},
         }
 
     RETURN_TYPES = ("MASK",)
@@ -435,7 +422,7 @@ class MaskSubMask:
     FUNCTION = "method"
     CATEGORY = "mask"
 
-    def method(self, mask1, mask2, merge_all, mask_inverse=False, threshold=0.5, **kwargs):
+    def method(self, mask1, mask2=None, merge_all=False, mask_inverse=False, threshold=0.5, **kwargs):
         return _combine_numbered_masks(mask1, mask2, merge_all, "sub", mask_inverse, threshold, kwargs)
 
 class MaskInvert:
