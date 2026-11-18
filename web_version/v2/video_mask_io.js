@@ -7,6 +7,8 @@ const PREVIEW_STATE = Symbol("logicLiteVideoMaskPreview");
 const LOAD_PREVIEW = Symbol("logicLiteLoadPreviewRequest");
 const LOAD_SETTINGS = ["video", "source_path", "frame_load_cap", "skip_first_frames", "select_every_nth",
     "force_rate", "custom_width", "custom_height", "sequence_fps", "missing_alpha"];
+const SEQUENCE_FILE = /\.(png|exr)$/i;
+const VIDEO_FILE = /\.(avi|flv|gif|m4v|mkv|mov|mp4|mpeg|mpg|mts|m2ts|ts|webm|wmv)$/i;
 const previews = new Set();
 
 function rememberVideo(widget, selected) {
@@ -52,11 +54,21 @@ function refreshLoadPreview(node) {
     }, 300);
 }
 
+function isImageSequence(files) {
+    const extension = files[0]?.name.match(SEQUENCE_FILE)?.[0].toLowerCase();
+    return Boolean(extension && files.every(file => file.name.toLowerCase().endsWith(extension)));
+}
+
+function acceptsDrop(files) {
+    if (files.length !== 1) return isImageSequence(files);
+    const file = files[0];
+    return SEQUENCE_FILE.test(file.name) || VIDEO_FILE.test(file.name) || file.type?.startsWith("video/");
+}
+
 async function uploadFiles(node, files) {
     if (!files.length) return;
     const sequence = files.length > 1;
-    const extension = files[0].name.match(/\.(png|exr)$/i)?.[0].toLowerCase();
-    if (sequence && (!extension || !files.every(file => file.name.toLowerCase().endsWith(extension)))) {
+    if (sequence && !isImageSequence(files)) {
         throw new Error("多檔上傳只接受同一格式的 PNG 或 EXR 序列；影片請一次選取一個檔案。");
     }
     const token = globalThis.crypto?.randomUUID?.() ?? `${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
@@ -83,6 +95,15 @@ async function uploadFiles(node, files) {
         widget.callback?.(selected, app.canvas, node);
         node.onWidgetChanged?.("video", selected, previous, widget);
         app.graph?.setDirtyCanvas(true, true);
+    }
+}
+
+async function uploadWithFeedback(node, files) {
+    try {
+        await uploadFiles(node, files);
+    } catch (error) {
+        app.extensionManager?.toast?.add({severity: "error", summary: "遮罩影片上傳失敗", detail: error.message});
+        console.error("遮罩影片上傳失敗", error);
     }
 }
 
@@ -208,6 +229,23 @@ app.registerExtension({
             const original = nodeType.prototype.onNodeCreated;
             nodeType.prototype.onNodeCreated = function () {
                 const result = original?.apply(this, arguments);
+                const dragOver = this.onDragOver;
+                this.onDragOver = function (event) {
+                    const transfer = event.dataTransfer;
+                    const files = Array.from(transfer?.files ?? []);
+                    // The browser hides filenames during dragover. Validate the actual files on drop.
+                    if (files.length ? acceptsDrop(files) : Array.from(transfer?.types ?? []).includes("Files")) return true;
+                    return dragOver?.apply(this, arguments) ?? false;
+                };
+                const dragDrop = this.onDragDrop;
+                this.onDragDrop = function (event) {
+                    const files = Array.from(event.dataTransfer?.files ?? []);
+                    if (!acceptsDrop(files)) return dragDrop?.apply(this, arguments) ?? false;
+                    event.preventDefault();
+                    event.stopPropagation();
+                    void uploadWithFeedback(this, files);
+                    return true;
+                };
                 this.addWidget("button", "上傳影片／PNG／EXR 序列", null, () => {
                     const input = document.createElement("input");
                     input.type = "file";
@@ -217,10 +255,7 @@ app.registerExtension({
                     input.addEventListener("cancel", () => input.remove(), {once: true});
                     input.onchange = async () => {
                         try {
-                            await uploadFiles(this, Array.from(input.files ?? []));
-                        } catch (error) {
-                            app.extensionManager?.toast?.add({severity: "error", summary: "遮罩影片上傳失敗", detail: error.message});
-                            console.error("遮罩影片上傳失敗", error);
+                            await uploadWithFeedback(this, Array.from(input.files ?? []));
                         } finally {
                             input.remove();
                         }

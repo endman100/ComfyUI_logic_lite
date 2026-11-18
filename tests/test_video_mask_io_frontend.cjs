@@ -158,6 +158,47 @@ test("多張高精度影格上傳至同一唯一序列資料夾", async () => {
     assert.ok(node.widgets[0].options.values.includes(node.widgets[0].value));
 });
 
+test("拖放影片或同格式序列會上傳、選中並重新預覽", async () => {
+    for (const [files, selected] of [
+        [[{name: "clip.MOV"}], "logic_lite_test-group/clip.MOV"],
+        [[{name: "0001.exr"}, {name: "0002.EXR"}], "logic_lite_test-group"],
+    ]) {
+        const {node, uploads, previewRequests, flushPreviews} = await fixture(LOAD_ID);
+        node.onNodeCreated();
+        assert.equal(node.onDragOver({dataTransfer: {types: ["Files"], files: []}}), true);
+        let prevented = false;
+        let stopped = false;
+        assert.equal(node.onDragDrop({dataTransfer: {files},
+            preventDefault() { prevented = true; }, stopPropagation() { stopped = true; }}), true);
+        assert.ok(prevented && stopped);
+        await new Promise(setImmediate);
+        assert.equal(uploads.length, files.length);
+        assert.ok(uploads.every(({url, options}) => url === "/upload/image" && options.body.values.get("type") === "input"));
+        assert.equal(node.widgets[0].value, selected);
+        assert.ok(node.widgets[0].options.values.includes(selected));
+        await flushPreviews();
+        assert.equal(previewRequests[0].video, selected);
+    }
+});
+
+test("拖放工作流、連結或混合序列仍交由原本的拖放處理", async () => {
+    const {makeNode, uploads} = await fixture(LOAD_ID);
+    const forwarded = [];
+    const {node} = await makeNode(LOAD_ID, Node => {
+        Node.prototype.onDragDrop = event => { forwarded.push(event); return false; };
+    });
+    node.onNodeCreated();
+    for (const files of [[], [{name: "workflow.json"}], [{name: "01.png"}, {name: "02.exr"}]]) {
+        const event = {dataTransfer: {files},
+            preventDefault() { assert.fail("unsupported drop was cancelled"); },
+            stopPropagation() { assert.fail("unsupported drop was consumed"); }};
+        assert.equal(node.onDragOver(event), false);
+        assert.equal(node.onDragDrop(event), false);
+        assert.equal(forwarded.at(-1), event);
+    }
+    assert.equal(uploads.length, 0);
+});
+
 test("上傳失敗或多部影片不會改寫已選路徑", async () => {
     for (const [status, files] of [[500, [{name: "a.mov"}]], [200, [{name: "a.mov"}, {name: "b.mov"}]],
         [200, [{name: "a.png"}, {name: "b.exr"}]]]) {
