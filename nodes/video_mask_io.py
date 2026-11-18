@@ -52,13 +52,16 @@ def _media_file(path):
             and any(path.is_relative_to(Path(root).resolve()) for root in roots))
 
 
-def _media_ui(preview, raw, archive_root=None):
+def _media_ui(preview, raw, archive_root=None, source=None):
     token = uuid4().hex
     if not all(_media_file(path) for path in raw):
         raw = ()
     _media[token] = (preview, tuple(raw), archive_root)
     url = f"{_MEDIA_ROUTE}/{token}"
-    return {"mask_video_previews": [{"preview": f"{url}/preview", "raw": f"{url}/raw" if raw else None}]}
+    item = {"preview": f"{url}/preview", "raw": f"{url}/raw" if raw else None}
+    if source is not None:
+        item["source"] = source
+    return {"mask_video_previews": [item]}
 
 
 def _zip_sequence(files, root):
@@ -518,8 +521,6 @@ class LoadVideoWithMask:
             info = _probe(first, ffmpeg, input_flags)
             reuse_preview = (unmodified and first.suffix.lower() == ".webm" and info.get("codec_name") == "vp9"
                              and info["has_alpha"] and _media_file(first))
-            if _preview_only and reuse_preview:
-                return _media_ui(first, (first,))
         if not info["has_alpha"] and missing_alpha == "error":
             raise ValueError("來源沒有 alpha；若需要全白遮罩，請將 missing_alpha 設為 ones")
         source_fps = sequence_fps if files is not None else info["fps"]
@@ -531,6 +532,12 @@ class LoadVideoWithMask:
             raise ValueError("目前僅支援 90 度倍數的影片旋轉資訊")
         turns = round(rotation / 90) % 4
         display_w, display_h = (source_h, source_w) if turns % 2 else (source_w, source_h)
+        source = None
+        if files is None:
+            source = {"width": display_w, "height": display_h, "fps": source_fps,
+                      "frames": _video_load_estimate(info, 0, 0, 1, 0), "has_audio": info["audio"] is not None}
+        if _preview_only and reuse_preview:
+            return _media_ui(first, (first,), source=source)
         width = width or (max(1, round(display_w * height / display_h)) if height else display_w)
         height = height or max(1, round(display_h * width / display_w))
         rate = force_rate or source_fps
@@ -574,8 +581,10 @@ class LoadVideoWithMask:
         preview = first
         if not reuse_preview:
             preview = _output_directory("mask_video_preview", False) / "preview.webm"
-            _write_preview(preview, rgba, alpha, fps, find_ffmpeg() if files is not None else ffmpeg)
-        ui = _media_ui(preview, files or (first,), archive_root)
+            _write_preview(preview, rgba, alpha, fps, find_ffmpeg() if files is not None else ffmpeg,
+                           audio_path=first if source and source["has_audio"] else None,
+                           audio_start=skip / rate, input_flags=input_flags if files is None else ())
+        ui = _media_ui(preview, files or (first,), archive_root, source=source)
         if _preview_only:
             return ui
         audio = (_load_audio(first, info["audio"], skip / rate, len(rgba) / fps, ffmpeg)
@@ -661,12 +670,13 @@ def _rgba_chunks(images, mask, repetitions, half=False, mask_only=False, preview
 
 
 def _encode(destination, kind, depth, images, mask, frame_rate, repetitions, ffmpeg,
-            mask_only=False, preview_size=None, progress=None):
+            mask_only=False, preview_size=None, progress=None, audio_args=()):
     height, width = preview_size or images.shape[1:3]
     floating = kind == "exr"
     raw_format = "rgba" if kind == "preview" else ("gbrapf32le" if floating else "rgba64le")
     command = [ffmpeg, "-v", "error", "-nostdin", "-n", "-f", "rawvideo", "-pixel_format", raw_format,
-               "-video_size", f"{width}x{height}", "-framerate", str(frame_rate), "-i", "pipe:0", "-an"]
+               "-video_size", f"{width}x{height}", "-framerate", str(frame_rate), "-i", "pipe:0"]
+    command += audio_args or ("-an",)
     if kind in ("prores", "prores_xq"):
         command += ["-c:v", "prores_ks", "-profile:v", "4444xq" if kind == "prores_xq" else "4444",
                     "-pix_fmt", "yuva444p12le", "-alpha_bits", "16"]
@@ -722,12 +732,19 @@ def _preview_sampling(frame_rate):
     return slice(0, stop, stride), fps
 
 
-def _write_preview(destination, images, mask, frame_rate, ffmpeg, progress=None):
+def _write_preview(destination, images, mask, frame_rate, ffmpeg, progress=None,
+                   *, audio_path=None, audio_start=0, input_flags=()):
     sample, fps = _preview_sampling(frame_rate)
     scale = min(1, 480 / max(images.shape[1:3]))
     size = tuple(max(2, 2 * math.floor(dimension * scale / 2)) for dimension in images.shape[1:3])
-    _encode(destination, "preview", "8", images[sample], None if mask is None else mask[sample],
-            fps, 1, ffmpeg, preview_size=size, progress=progress)
+    frames = images[sample]
+    audio_args = ()
+    if audio_path is not None:
+        audio_args = [*input_flags, "-ss", str(audio_start), "-i", str(audio_path),
+                      "-map", "0:v:0", "-map", "1:a:0", "-af", f"atrim=duration={len(frames) / fps}",
+                      "-c:a", "libopus", "-b:a", "64k"]
+    _encode(destination, "preview", "8", frames, None if mask is None else mask[sample],
+            fps, 1, ffmpeg, preview_size=size, progress=progress, audio_args=audio_args)
 
 
 def _output_directory(prefix, save_output):

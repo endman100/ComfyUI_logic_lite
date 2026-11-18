@@ -13,7 +13,7 @@ const SAVE_ID = "Video Combine With Mask (endman100)";
 const PRORES = "[mask] ProRes 4444 (.mov)";
 const H264 = "[no mask] H.264 (.mp4)";
 
-async function fixture(name, status = 200) {
+async function fixture(name, status = 200, deferUpload = false) {
     let extension;
     const elements = [];
     const uploads = [];
@@ -42,23 +42,29 @@ async function fixture(name, status = 200) {
     const api = {
         apiURL(value) { return `/prefix${value}`; },
         async fetchApi(url, options) {
-            if (url === "/logiclite/video-mask/load-preview") {
-                previewRequests.push(JSON.parse(options.body));
-                return {ok: true, async json() { return {mask_video_previews: [media]}; }};
-            }
-            uploads.push({url, options});
-            return {ok: status === 200, status, async json() {
-                return {name: options.body.values.get("image").name, subfolder: options.body.values.get("subfolder")};
-            }};
+            assert.equal(url, "/logiclite/video-mask/load-preview");
+            previewRequests.push(JSON.parse(options.body));
+            return {ok: true, async json() { return {mask_video_previews: [media]}; }};
         },
     };
+    class XMLHttpRequest {
+        upload = {};
+        open(method, url) { Object.assign(this, {method, url}); }
+        send(body) {
+            uploads.push({url: this.url, options: {method: this.method, body}, xhr: this});
+            this.status = status;
+            this.response = {name: body.values.get("image").name, subfolder: body.values.get("subfolder")};
+            if (!deferUpload) queueMicrotask(() => this.onload());
+        }
+    }
     const document = {
         body: {append() {}},
         createElement(tag) {
-            const element = {tag, style: {}, children: [], removed: false,
+            const element = {tag, style: {}, children: [], removed: false, events: {},
                 append(value) { this.children.push(value); },
                 replaceChildren() { this.children = []; },
-                addEventListener() {},
+                addEventListener(type, callback) { this.events[type] = callback; },
+                setAttribute(key, value) { this[key] = value; },
                 click() { this.clicked = true; }, remove() { this.removed = true; },
                 pause() { this.paused = true; }, removeAttribute(key) { delete this[key]; }, load() {},
                 async play() { this.paused = false; },
@@ -71,7 +77,7 @@ async function fixture(name, status = 200) {
         constructor() { this.values = new Map(); }
         append(key, value) { this.values.set(key, value); }
     }
-    vm.runInNewContext(source, {__app: app, __api: api, document, FormData, LGraphCanvas: Canvas,
+    vm.runInNewContext(source, {__app: app, __api: api, document, FormData, XMLHttpRequest, LGraphCanvas: Canvas,
         crypto: {randomUUID: () => "test-group"}, URLSearchParams, AbortController,
         setTimeout(callback) { timers.set(++nextTimer, callback); return nextTimer; },
         clearTimeout(timer) { timers.delete(timer); }, console: {error() {}}}, {filename: file});
@@ -113,8 +119,12 @@ async function fixture(name, status = 200) {
                 this.dom.push(widget);
                 return widget;
             }
-            computeSize() { return [320, 400]; }
-            setSize(value) { this.size = value; }
+            computeSize() { return [320, 400 + this.dom.reduce((height, widget) =>
+                height + (widget.hidden ? 0 : widget.options.getMinHeight()), 0)]; }
+            setSize(value) {
+                this.size = value;
+                this.dom.forEach(widget => widget.options.afterResize?.());
+            }
             setDirtyCanvas() {}
         }
         const original = Node.prototype.onNodeCreated;
@@ -136,14 +146,14 @@ test("單檔上傳使用 ComfyUI 端點並加入下拉選單", async () => {
     assert.equal(input.multiple, true);
     input.files = [{name: "alpha.mov"}];
     await input.onchange();
-    assert.equal(uploads[0].url, "/upload/image");
+    assert.equal(uploads[0].url, "/prefix/upload/image");
     assert.equal(uploads[0].options.body.values.get("overwrite"), "false");
     assert.equal(node.widgets[0].value, "logic_lite_test-group/alpha.mov");
     assert.ok(node.widgets[0].options.values.includes(node.widgets[0].value));
     assert.equal(node.widgets[1].value, "");
     await flushPreviews();
     assert.equal(previewRequests[0].video, "logic_lite_test-group/alpha.mov");
-    assert.equal(node.dom[0].container.children[0].tag, "video");
+    assert.equal(node.dom.find(widget => widget.name === "mask_video_preview").container.children[0].tag, "video");
     assert.equal(input.removed, true);
 });
 
@@ -173,11 +183,41 @@ test("拖放影片或同格式序列會上傳、選中並重新預覽", async ()
         assert.ok(prevented && stopped);
         await new Promise(setImmediate);
         assert.equal(uploads.length, files.length);
-        assert.ok(uploads.every(({url, options}) => url === "/upload/image" && options.body.values.get("type") === "input"));
+        assert.ok(uploads.every(({url, options}) => url === "/prefix/upload/image" && options.body.values.get("type") === "input"));
         assert.equal(node.widgets[0].value, selected);
         assert.ok(node.widgets[0].options.values.includes(selected));
         await flushPreviews();
         assert.equal(previewRequests[0].video, selected);
+    }
+});
+
+test("上傳按鈕和拖放共用進度條，序列按檔案大小累計並在結束時隱藏", async () => {
+    for (const drag of [false, true]) {
+        const {node, elements, uploads} = await fixture(LOAD_ID, 200, true);
+        node.onNodeCreated();
+        const files = [{name: "one.png", size: 100}, {name: "two.png", size: 300}];
+        if (drag) {
+            node.onDragDrop({dataTransfer: {files}, preventDefault() {}, stopPropagation() {}});
+        } else {
+            node.widgets.at(-1).callback();
+            const input = elements.at(-1);
+            input.files = files;
+            void input.onchange();
+        }
+        const widget = node.dom.find(widget => widget.name === "mask_video_upload_progress");
+        const progress = widget.container.children[0];
+        assert.equal(widget.hidden, false);
+        assert.equal(progress.tag, "progress");
+        uploads[0].xhr.upload.onprogress({lengthComputable: true, loaded: 50, total: 100});
+        assert.equal(progress.value, 0.125);
+        uploads[0].xhr.onload();
+        await new Promise(setImmediate);
+        uploads[1].xhr.upload.onprogress({lengthComputable: true, loaded: 150, total: 300});
+        assert.equal(progress.value, 0.625);
+        uploads[1].xhr.onload();
+        await new Promise(setImmediate);
+        assert.equal(progress.value, 1);
+        assert.equal(widget.hidden, true);
     }
 });
 
@@ -228,6 +268,8 @@ test("還原舊來源及變更選幀參數會更新預覽", async () => {
 
 const media = {preview: "/logiclite/video-mask/test/preview", raw: "/logiclite/video-mask/test/raw"};
 const output = {mask_video_previews: [media], mask_video_files: ["D:\\output\\shot\\manifest.json"]};
+const previewActions = ["Pause preview", "Hide preview", "Sync preview", "Download raw"];
+const loaderActions = type => type === LOAD_ID ? ["Open preview", "Save preview"] : [];
 
 function menuItems(node) {
     const options = node.canvas.getNodeMenuOptions(node);
@@ -252,7 +294,7 @@ test("both preview menus survive chained third-party hooks and a wrapped node re
         node.onExecuted(output);
         const items = menuItems(new Proxy(node, {}));
         assert.deepEqual(Array.from(items, item => item.content), [
-            "Pause preview", "Hide preview", "Sync preview", "Download raw",
+            ...previewActions, ...loaderActions(type),
             "Earlier returned item", "Later extension", "Earlier extension",
         ]);
         items[0].callback();
@@ -266,9 +308,42 @@ test("a node-level menu replacement still keeps the loaded preview actions", asy
         Node.prototype.getExtraMenuOptions = () => [{content: "Replacement extension"}];
         node.onExecuted(output);
         assert.deepEqual(Array.from(menuItems(node), item => item.content), [
-            "Pause preview", "Hide preview", "Sync preview", "Download raw", "Replacement extension",
+            ...previewActions, ...loaderActions(type), "Replacement extension",
         ]);
     }
+});
+
+test("預覽依實際比例配合節點寬度，並只在滑鼠移入時開啟聲音", async () => {
+    const {node, elements} = await fixture(LOAD_ID);
+    const source = {width: 200, height: 300, fps: 29.97, frames: 60, has_audio: true};
+    node.onExecuted({mask_video_previews: [{...media, source}]});
+    const {container, options} = node.dom[0];
+    const video = container.children[0];
+    Object.assign(video, {videoWidth: 200, videoHeight: 300});
+    video.events.loadedmetadata();
+    assert.equal(options.getMinHeight(), 470);
+    assert.equal(options.getMaxHeight(), 470);
+    assert.equal(node.size[1], 870);
+    node.setSize([420, 400]);
+    assert.equal(node.size[1], 1020);
+    assert.equal(video.muted, true);
+    video.events.pointerenter();
+    assert.equal(video.muted, false);
+    video.events.pointerleave();
+    assert.equal(video.muted, true);
+    const action = label => menuItems(node).find(item => item.content === label).callback();
+    action("Mute preview");
+    video.events.pointerenter();
+    assert.equal(video.muted, true);
+    action("Unmute preview");
+    video.events.pointerenter();
+    assert.equal(video.muted, false);
+    action("Hide preview");
+    assert.equal(video.muted, true);
+    assert.ok(menuItems(node).some(item => item.disabled && item.content === "200×300 @ 29.97 fps · 60 frames"));
+    action("Save preview");
+    assert.equal(elements.at(-1).href, `/prefix${media.preview}`);
+    assert.equal(elements.at(-1).download, "preview.webm");
 });
 
 test("both nodes play muted looping video without path text and release old media", async () => {
@@ -354,7 +429,7 @@ test("both node menus pause, hide, sync the current graph and download raw", asy
     const video = node => node.dom[0].container.children[0];
     const action = (node, label) => menuItems(node).find(item => item.content === label).callback();
     for (const node of [load, save]) {
-        assert.deepEqual(menuItems(node).map(item => item.content), ["Pause preview", "Hide preview", "Sync preview", "Download raw"]);
+        assert.deepEqual(menuItems(node).map(item => item.content), [...previewActions, ...loaderActions(node === load ? LOAD_ID : SAVE_ID)]);
         action(node, "Pause preview");
         assert.equal(video(node).paused, true);
         assert.equal(video(node).autoplay, false);

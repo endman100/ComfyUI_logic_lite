@@ -5,6 +5,7 @@ const LOAD_ID = "Load Video With Mask (Upload) (endman100)";
 const SAVE_ID = "Video Combine With Mask (endman100)";
 const PREVIEW_STATE = Symbol("logicLiteVideoMaskPreview");
 const LOAD_PREVIEW = Symbol("logicLiteLoadPreviewRequest");
+const UPLOAD_PROGRESS = Symbol("logicLiteUploadProgress");
 const LOAD_SETTINGS = ["video", "source_path", "frame_load_cap", "skip_first_frames", "select_every_nth",
     "force_rate", "custom_width", "custom_height", "sequence_fps", "missing_alpha"];
 const SEQUENCE_FILE = /\.(png|exr)$/i;
@@ -65,14 +66,33 @@ function acceptsDrop(files) {
     return SEQUENCE_FILE.test(file.name) || VIDEO_FILE.test(file.name) || file.type?.startsWith("video/");
 }
 
-async function uploadFiles(node, files) {
-    if (!files.length) return;
+function uploadFile(form, onProgress) {
+    return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open("POST", api.apiURL("/upload/image"));
+        if (api.user) xhr.setRequestHeader("Comfy-User", api.user);
+        xhr.responseType = "json";
+        xhr.upload.onprogress = event => {
+            if (event.lengthComputable && event.total) onProgress(event.loaded / event.total);
+        };
+        xhr.onload = () => {
+            if (xhr.status >= 200 && xhr.status < 300 && xhr.response?.name) resolve(xhr.response);
+            else reject(new Error(`上傳失敗：HTTP ${xhr.status}`));
+        };
+        xhr.onerror = xhr.onabort = () => reject(new Error("上傳連線中斷"));
+        xhr.send(form);
+    });
+}
+
+async function uploadFiles(node, files, progress) {
     const sequence = files.length > 1;
     if (sequence && !isImageSequence(files)) {
         throw new Error("多檔上傳只接受同一格式的 PNG 或 EXR 序列；影片請一次選取一個檔案。");
     }
     const token = globalThis.crypto?.randomUUID?.() ?? `${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
     const subfolder = `logic_lite_${token}`;
+    const total = files.reduce((bytes, file) => bytes + (file.size || 1), 0);
+    let sent = 0;
     let selected;
     for (const file of files) {
         const form = new FormData();
@@ -80,9 +100,10 @@ async function uploadFiles(node, files) {
         form.append("type", "input");
         form.append("subfolder", subfolder);
         form.append("overwrite", "false");
-        const response = await api.fetchApi("/upload/image", {method: "POST", body: form});
-        if (!response.ok) throw new Error(`上傳失敗：HTTP ${response.status}`);
-        const saved = await response.json();
+        const size = file.size || 1;
+        const saved = await uploadFile(form, fraction => { progress.value = (sent + size * fraction) / total; });
+        sent += size;
+        progress.value = sent / total;
         selected = sequence ? saved.subfolder : [saved.subfolder, saved.name].filter(Boolean).join("/");
     }
     const widget = node.widgets?.find(widget => widget.name === "video");
@@ -99,11 +120,33 @@ async function uploadFiles(node, files) {
 }
 
 async function uploadWithFeedback(node, files) {
+    if (!files.length) return;
+    let upload = node[UPLOAD_PROGRESS];
+    if (!upload) {
+        const container = document.createElement("div");
+        const progress = document.createElement("progress");
+        progress.setAttribute("aria-label", "上傳進度");
+        progress.title = "上傳進度";
+        progress.max = 1;
+        progress.style.width = "100%";
+        container.style.pointerEvents = "none";
+        container.append(progress);
+        const widget = node.addDOMWidget("mask_video_upload_progress", "progress", container, {
+            serialize: false, getMinHeight: () => 26, getMaxHeight: () => 26,
+        });
+        upload = node[UPLOAD_PROGRESS] = {container, progress, widget};
+    } else if (!upload.widget.hidden) return;
+    upload.widget.hidden = upload.container.hidden = false;
+    upload.progress.value = 0;
+    resizeNode(node);
     try {
-        await uploadFiles(node, files);
+        await uploadFiles(node, files, upload.progress);
     } catch (error) {
         app.extensionManager?.toast?.add({severity: "error", summary: "遮罩影片上傳失敗", detail: error.message});
         console.error("遮罩影片上傳失敗", error);
+    } finally {
+        upload.widget.hidden = upload.container.hidden = true;
+        if (node.graph) resizeNode(node);
     }
 }
 
@@ -135,34 +178,71 @@ function updateMaskModeVisibility(node) {
 function updatePlayback(state) {
     for (const video of state.videos) {
         video.autoplay = !state.paused && !state.hidden;
-        if (!video.autoplay) video.pause();
-        else video.play().catch(() => {});
+        if (!video.autoplay) {
+            video.muted = true;
+            video.pause();
+        } else video.play().catch(() => {});
     }
 }
 
-function showPreviews(node, media) {
+function showPreviews(node, media, isLoader = true) {
     let state = node[PREVIEW_STATE];
     if (!state && !media.length) return;
     if (!state) {
         const container = document.createElement("div");
         container.style.pointerEvents = "none";
-        state = {node, container, videos: [], raw: [], paused: false, hidden: false};
+        state = {node, container, isLoader, videos: [], raw: [], paused: false, hidden: false, muted: false};
+        const previewHeight = () => {
+            const padding = (state.widget?.margin ?? 10) * 2;
+            const width = Math.max(1, node.size[0] - padding);
+            return padding + state.videos.reduce((height, video) =>
+                height + width * (video.videoHeight / video.videoWidth || 9 / 16), 0);
+        };
+        let lastWidth = node.size[0];
         state.widget = node.addDOMWidget("mask_video_preview", "video", container, {
-            serialize: false,
-            getMinHeight: () => state.videos.reduce((sum, video) => {
-                const ratio = video.videoHeight / video.videoWidth || 9 / 16;
-                return sum + Math.min(220, Math.max(1, node.size[0] - 20) * ratio);
-            }, 0),
+            serialize: false, getMinHeight: previewHeight, getMaxHeight: previewHeight,
+            afterResize: () => {
+                if (lastWidth === node.size[0]) return;
+                lastWidth = node.size[0];
+                if (!state.widget.hidden && node.graph) resizeNode(node);
+            },
         });
         node[PREVIEW_STATE] = state;
         previews.add(state);
     }
     releaseVideos(state);
     state.raw = media.map(item => item.raw);
+    state.source = media[0]?.source;
     for (const item of media) {
         const video = document.createElement("video");
         video.loop = video.muted = video.playsInline = true;
-        Object.assign(video.style, {display: "block", width: "100%", maxHeight: "220px", objectFit: "contain"});
+        Object.assign(video.style, {display: "block", width: "100%", height: "auto"});
+        if (state.isLoader) {
+            video.style.pointerEvents = "auto";
+            const playHoverAudio = () => {
+                if (state.muted || state.paused || state.hidden) return;
+                video.muted = false;
+                video.play().catch(() => {
+                    // A browser may require activation before audible playback.
+                    video.muted = true;
+                    if (!state.paused && !state.hidden) video.play().catch(() => {});
+                });
+            };
+            video.addEventListener("pointerenter", playHoverAudio);
+            video.addEventListener("pointerleave", () => { video.muted = true; });
+            video.addEventListener("click", playHoverAudio);
+            video.addEventListener("contextmenu", event => {
+                event.preventDefault();
+                app.canvas.adjustMouseEvent(event);
+                app.canvas.processContextMenu(node, event);
+            });
+            video.addEventListener("wheel", event => app.canvas.processMouseWheel(event), {passive: false});
+            for (const type of ["dragover", "drop"]) {
+                video.addEventListener(type, event => {
+                    if (!app.canvas.canvas.dispatchEvent(new DragEvent(type, event))) event.preventDefault();
+                });
+            }
+        }
         video.addEventListener("loadedmetadata", () => resizeNode(node));
         video.src = api.apiURL(item.preview);
         state.videos.push(video);
@@ -173,10 +253,10 @@ function showPreviews(node, media) {
     resizeNode(node);
 }
 
-function downloadRaw(url) {
+function downloadFile(url, filename = "") {
     const link = document.createElement("a");
-    link.href = api.apiURL(url);
-    link.download = "";
+    link.href = url;
+    link.download = filename;
     document.body.append(link);
     link.click();
     link.remove();
@@ -216,10 +296,24 @@ app.registerExtension({
                 },
             }];
             const downloads = state.raw.flatMap((url, index) => url ? [{
-                content: `Result ${index + 1}`, callback: () => downloadRaw(url),
+                content: `Result ${index + 1}`, callback: () => downloadFile(api.apiURL(url)),
             }] : []);
             if (downloads.length === 1) items.push({...downloads[0], content: "Download raw"});
             if (downloads.length > 1) items.push({content: "Download raw", has_submenu: true, submenu: {options: downloads}});
+            if (state.isLoader) {
+                const video = state.videos[0];
+                items.push({content: "Open preview", callback: () => window.open(video.src, "_blank", "noopener")},
+                    {content: "Save preview", callback: () => downloadFile(video.src, "preview.webm")});
+                const source = state.source;
+                if (source?.has_audio) items.push({
+                    content: state.muted ? "Unmute preview" : "Mute preview",
+                    callback: () => { state.muted = !state.muted; if (state.muted) video.muted = true; },
+                });
+                if (source) items.push({disabled: true,
+                    content: `${source.width}×${source.height} @ ${Number(source.fps.toFixed(2))} fps` +
+                        (source.frames ? ` · ${source.frames} frames` : ""),
+                });
+            }
             return [...items, null, ...options];
         };
     },
@@ -302,7 +396,7 @@ app.registerExtension({
         const executed = nodeType.prototype.onExecuted;
         nodeType.prototype.onExecuted = function (output) {
             const result = executed?.apply(this, arguments);
-            showPreviews(this, output?.mask_video_previews ?? []);
+            showPreviews(this, output?.mask_video_previews ?? [], nodeData.name === LOAD_ID);
             return result;
         };
         const removed = nodeType.prototype.onRemoved;

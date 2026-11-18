@@ -92,7 +92,7 @@ class VideoMaskIOTests(unittest.TestCase):
     def media(self, ui):
         self.assertEqual(set(ui), {"mask_video_previews"})
         item, = ui["mask_video_previews"]
-        self.assertEqual(set(item), {"preview", "raw"})
+        self.assertEqual(set(item) - {"source"}, {"preview", "raw"})
         self.assertRegex(item["preview"], r"^/logiclite/video-mask/[0-9a-f]{32}/preview$")
         if item["raw"] is not None:
             self.assertEqual(item["raw"], item["preview"].removesuffix("preview") + "raw")
@@ -643,16 +643,29 @@ class VideoMaskIOTests(unittest.TestCase):
         self.require_codec("libx264")
         self.require_codec("aac")
         self.require_codec("libvpx-vp9")
+        self.require_codec("libopus")
         path = self.root / "input" / "audio.mp4"
         subprocess.run([self.ffmpeg, "-v", "error", "-f", "lavfi", "-i", "color=size=32x24:rate=12:duration=2",
                         "-f", "lavfi", "-i", "sine=sample_rate=48000:duration=2", "-c:v", "libx264",
                         "-c:a", "aac", str(path)], check=True)
-        results = io.LoadVideoWithMask().load_video(path.name, skip_first_frames=6, frame_load_cap=3)["result"]
+        loaded = io.LoadVideoWithMask().load_video(path.name, skip_first_frames=6, frame_load_cap=3)
+        results = loaded["result"]
         self.assertEqual(results[2:4], (3, 12))
         self.assertTrue(json.loads(results[4])["has_audio"])
         audio = results[5]
         self.assertEqual(audio["sample_rate"], 48000)
         self.assertEqual(audio["waveform"].shape, (1, 1, 12000))
+        live = io.LoadVideoWithMask().load_video(path.name, skip_first_frames=6, frame_load_cap=3,
+                                                _preview_only=True)
+        for ui in (loaded["ui"], live):
+            item, preview = self.media(ui)
+            self.assertEqual(item["source"], {"width": 32, "height": 24, "fps": 12, "frames": 24,
+                                             "has_audio": True})
+            info = io._probe(preview, self.ffmpeg)
+            self.assertEqual(info["codec_name"], "vp9")
+            self.assertTrue(info["has_alpha"])
+            self.assertEqual(info["audio"]["codec_name"], "opus")
+            self.assertAlmostEqual(info["duration_seconds"], 0.25, delta=0.03)
 
     def test_media_route_serves_exact_files_and_sequence_zip(self):
         images, alpha = synthetic()
