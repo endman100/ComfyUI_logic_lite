@@ -18,6 +18,7 @@ from zipfile import ZipFile
 
 from aiohttp import web
 from aiohttp.helpers import content_disposition_header
+from comfy.utils import ProgressBar
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -147,10 +148,11 @@ def find_ffprobe(ffmpeg):
 
 def _probe(path, ffmpeg):
     result = subprocess.run([find_ffprobe(ffmpeg), "-v", "error", "-select_streams", "v:0",
-                             "-show_streams", "-of", "json", str(path)], capture_output=True)
+                             "-show_streams", "-show_format", "-of", "json", str(path)], capture_output=True)
     if result.returncode:
         raise RuntimeError("無法讀取媒體資訊：" + result.stderr.decode("utf-8", errors="replace"))
-    streams = json.loads(result.stdout).get("streams", [])
+    metadata = json.loads(result.stdout)
+    streams = metadata.get("streams", [])
     if not streams:
         raise ValueError(f"檔案沒有影像軌：{path}")
     stream = streams[0]
@@ -162,6 +164,15 @@ def _probe(path, ffmpeg):
         stream["fps"] = float(Fraction(stream.get("avg_frame_rate", "0/1")))
     except (ValueError, ZeroDivisionError):
         stream["fps"] = 0.0
+    stream["duration_seconds"] = 0.0
+    for value in (stream.get("duration"), metadata.get("format", {}).get("duration")):
+        try:
+            duration = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(duration) and duration > 0:
+            stream["duration_seconds"] = duration
+            break
     return stream
 
 
@@ -275,6 +286,18 @@ def _load_sequence(first, files, sequence_fps, force_rate, skip, nth, cap, missi
         if _sequence_signature(path) != signature:
             raise ValueError(f"序列影格必須具有相同尺寸、位元深度與通道：{path}")
 
+    # 以影格中心的時間做最近鄰重採樣，再套用跳格、抽格與 cap；不插值原始像素。
+    rate = force_rate or sequence_fps
+    count = math.floor(len(files) * rate / sequence_fps + 0.5)
+    stop = min(count, skip + cap * nth) if cap else count
+    positions = np.arange(skip, stop, nth, dtype=np.int64)
+    indices = np.minimum(np.floor((positions + 0.5) * sequence_fps / rate).astype(np.int64), len(files) - 1)
+    if not len(indices):
+        raise ValueError("選取後沒有影格；請檢查 skip_first_frames 與 frame_load_cap")
+    unique, inverse = np.unique(indices, return_inverse=True)
+    # The first frame also supplies the source metadata when the selection skips it.
+    progress = ProgressBar(len(unique) + int(unique[0] != 0) + 1)
+
     def read(path):
         try:
             frame = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
@@ -287,22 +310,14 @@ def _load_sequence(first, files, sequence_fps, force_rate, skip, nth, cap, missi
             raise ValueError(f"序列僅支援灰階、RGB 或 RGBA：{path}")
         if frame.dtype not in (np.uint8, np.uint16, np.float32):
             raise ValueError(f"不支援的序列像素型別 {frame.dtype}：{path}")
+        progress.update(1)
         return frame
 
     first_frame = read(first)
     has_alpha = first_frame.ndim == 3 and first_frame.shape[-1] == 4
     if not has_alpha and missing_alpha == "error":
         raise ValueError("來源沒有 alpha；若需要全白遮罩，請將 missing_alpha 設為 ones")
-    # 以影格中心的時間做最近鄰重採樣，再套用跳格、抽格與 cap；不插值原始像素。
-    rate = force_rate or sequence_fps
-    count = math.floor(len(files) * rate / sequence_fps + 0.5)
-    stop = min(count, skip + cap * nth) if cap else count
-    positions = np.arange(skip, stop, nth, dtype=np.int64)
-    indices = np.minimum(np.floor((positions + 0.5) * sequence_fps / rate).astype(np.int64), len(files) - 1)
-    if not len(indices):
-        raise ValueError("選取後沒有影格；請檢查 skip_first_frames 與 frame_load_cap")
     # 每個檔案僅 imread 一次；整批 stack、通道重排與數值轉換均向量化。
-    unique, inverse = np.unique(indices, return_inverse=True)
     frames = [first_frame if index == 0 else read(files[index]) for index in unique]
     if any(frame.shape != first_frame.shape or frame.dtype != first_frame.dtype for frame in frames):
         raise ValueError("序列影格必須具有相同尺寸、位元深度與通道")
@@ -317,7 +332,7 @@ def _load_sequence(first, files, sequence_fps, force_rate, skip, nth, cap, missi
     rgba = torch.from_numpy(np.concatenate((rgb, alpha), axis=-1))
     info = {"width": first_frame.shape[1], "height": first_frame.shape[0], "has_alpha": has_alpha,
             "pix_fmt": f"opencv_{'BGRA' if has_alpha else ('gray' if first_frame.ndim == 2 else 'BGR')}_{first_frame.dtype}"}
-    return rgba, info
+    return rgba, info, progress
 
 
 def _process_error(log, operation):
@@ -326,11 +341,11 @@ def _process_error(log, operation):
     return RuntimeError(f"ffmpeg {operation}失敗：" + log.read().decode("utf-8", errors="replace"))
 
 
-def _decode(args, width, height, floating, ffmpeg, has_alpha=True, grayscale=False):
+def _decode(args, width, height, floating, ffmpeg, progress, has_alpha=True, grayscale=False):
     channels = (1 if grayscale else (4 if has_alpha else 3)) if floating else 4
     dtype = np.dtype("<f4" if floating else "<u2")
     frame_bytes = width * height * channels * dtype.itemsize
-    chunk_size = frame_bytes * max(1, _BUFFER_BYTES // frame_bytes)
+    chunk = memoryview(bytearray(frame_bytes * max(1, _BUFFER_BYTES // frame_bytes)))
     pixel_format = ("grayf32le" if grayscale else ("gbrapf32le" if has_alpha else "gbrpf32le")) if floating else "rgba64le"
     command = [ffmpeg, "-v", "error", "-nostdin", "-hwaccel", "none", "-noautorotate", "-threads", "2",
                *args, "-map", "0:v:0", "-an", "-sn", "-dn", "-pix_fmt", pixel_format,
@@ -339,11 +354,20 @@ def _decode(args, width, height, floating, ffmpeg, has_alpha=True, grayscale=Fal
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=log)
         try:
             while True:
-                raw = process.stdout.read(chunk_size)
-                if not raw:
+                filled = 0
+                while filled < len(chunk):
+                    end = filled + frame_bytes
+                    read = process.stdout.readinto(chunk[filled:end])
+                    if not read:
+                        break
+                    if read != frame_bytes:
+                        raise RuntimeError("ffmpeg 傳回不完整影格，請確認序列尺寸與格式一致")
+                    filled = end
+                    loaded = progress.current + 1
+                    progress.update_absolute(loaded, max(progress.total, loaded + 1))
+                if not filled:
                     break
-                if len(raw) % frame_bytes:
-                    raise RuntimeError("ffmpeg 傳回不完整影格，請確認序列尺寸與格式一致")
+                raw = chunk[:filled]
                 if floating:
                     planes = np.frombuffer(raw, dtype=dtype).reshape(-1, channels, height, width)
                     order = [0, 0, 0] if grayscale else ([2, 0, 1, 3] if has_alpha else [2, 0, 1])
@@ -361,6 +385,16 @@ def _decode(args, width, height, floating, ffmpeg, has_alpha=True, grayscale=Fal
             if process.poll() is None:
                 process.kill()
             process.wait()
+
+
+def _video_load_estimate(info, force_rate, skip, nth, cap):
+    reported = str(info.get("nb_frames", ""))
+    frames = int(reported) if reported.isdecimal() else 0
+    if force_rate or not frames:
+        duration = info["duration_seconds"] or frames / info["fps"]
+        frames = round(duration * (force_rate or info["fps"]))
+    selected = max(0, (frames - skip + nth - 1) // nth)
+    return min(cap, selected) if cap and selected else selected or cap
 
 
 class LoadVideoWithMask:
@@ -402,7 +436,7 @@ class LoadVideoWithMask:
             raise ValueError("missing_alpha 必須是 ones 或 error")
         first, files = _resolve_source(video)
         if files is not None:
-            rgba, info = _load_sequence(first, files, sequence_fps, force_rate, skip, nth, cap, missing_alpha)
+            rgba, info, progress = _load_sequence(first, files, sequence_fps, force_rate, skip, nth, cap, missing_alpha)
         else:
             ffmpeg = find_ffmpeg()
             info = _probe(first, ffmpeg)
@@ -430,6 +464,7 @@ class LoadVideoWithMask:
                                      align_corners=False).movedim(1, -1)
             batches.append(rgba)
         else:
+            progress = ProgressBar(_video_load_estimate(info, force_rate, skip, nth, cap) + 1)
             inputs = ["-i", str(first)]
             # VP9 原生解碼器可能忽略 WebM alpha；明確使用 libvpx 解碼。
             if info.get("codec_name") == "vp9" and info["has_alpha"]:
@@ -437,7 +472,7 @@ class LoadVideoWithMask:
             args = [*inputs, "-vf", ",".join(filters)]
             if cap:
                 args += ["-frames:v", str(cap)]
-            for batch in _decode(args, source_w, source_h, floating, ffmpeg,
+            for batch in _decode(args, source_w, source_h, floating, ffmpeg, progress,
                                  has_alpha=info["has_alpha"], grayscale=info.get("pix_fmt", "").startswith("gray")):
                 if turns:
                     batch = torch.rot90(batch, turns, dims=(1, 2))
@@ -463,8 +498,11 @@ class LoadVideoWithMask:
             preview = directory / "preview.webm"
             _write_preview(preview, rgba, alpha, fps, find_ffmpeg() if files is not None else ffmpeg)
         archive_root = Path(os.path.commonpath([path.parent for path in files])) if files else None
-        return {"ui": _media_ui(preview, files or (first,), archive_root),
-                "result": (rgba[..., :3].contiguous(), alpha, len(rgba), fps, json.dumps(metadata, ensure_ascii=False))}
+        result = {"ui": _media_ui(preview, files or (first,), archive_root),
+                  "result": (rgba[..., :3].contiguous(), alpha, len(rgba), fps, json.dumps(metadata, ensure_ascii=False))}
+        completed = progress.current + 1
+        progress.update_absolute(completed, completed)
+        return result
 
 
 def _validate_images(images, mask):
@@ -516,7 +554,8 @@ def _rgba_chunks(images, mask, repetitions, half=False, mask_only=False, preview
             yield rgba.astype(np.float16).astype(np.float32) if half else rgba
 
 
-def _encode(destination, kind, depth, images, mask, frame_rate, repetitions, ffmpeg, mask_only=False, preview_size=None):
+def _encode(destination, kind, depth, images, mask, frame_rate, repetitions, ffmpeg,
+            mask_only=False, preview_size=None, progress=None):
     height, width = preview_size or images.shape[1:3]
     floating = kind == "exr"
     raw_format = "rgba" if kind == "preview" else ("gbrapf32le" if floating else "rgba64le")
@@ -552,6 +591,8 @@ def _encode(destination, kind, depth, images, mask, frame_rate, repetitions, ffm
                     else:
                         data = np.rint(np.clip(rgba, 0, 1) * 65535).astype("<u2")
                     process.stdin.write(data.tobytes())
+                    if progress is not None:
+                        progress.update(len(data))
                 process.stdin.close()
             except BrokenPipeError:
                 process.wait()
@@ -568,14 +609,19 @@ def _encode(destination, kind, depth, images, mask, frame_rate, repetitions, ffm
                 pass
 
 
-def _write_preview(destination, images, mask, frame_rate, ffmpeg):
+def _preview_sampling(frame_rate):
     stride = max(1, math.ceil(frame_rate / 15))
     fps = frame_rate / stride
     stop = max(1, math.floor(8 * fps)) * stride
+    return slice(0, stop, stride), fps
+
+
+def _write_preview(destination, images, mask, frame_rate, ffmpeg, progress=None):
+    sample, fps = _preview_sampling(frame_rate)
     scale = min(1, 480 / max(images.shape[1:3]))
     size = tuple(max(2, 2 * math.floor(dimension * scale / 2)) for dimension in images.shape[1:3])
-    _encode(destination, "preview", "8", images[:stop:stride], None if mask is None else mask[:stop:stride],
-            fps, 1, ffmpeg, preview_size=size)
+    _encode(destination, "preview", "8", images[sample], None if mask is None else mask[sample],
+            fps, 1, ffmpeg, preview_size=size, progress=progress)
 
 
 def _output_directory(prefix, save_output):
@@ -635,6 +681,11 @@ class VideoCombineWithMask:
         if kind in ("h264", "vp9") and any(size % 2 for size in images.shape[1:3]):
             raise ValueError("H.264／VP9 的 4:2:0 格式需要偶數寬高；不會自動裁切或補邊")
         ffmpeg = find_ffmpeg()
+        extra_mask = has_mask and (save_mask_sequence or (kind == "h264" and mask_mode == "separate_png"))
+        frame_count = len(images) * repetitions
+        preview_frames = len(images[_preview_sampling(frame_rate)[0]]) if kind != "vp9" else 0
+        # Finish only after FFmpeg has flushed its last pass and the output is registered.
+        progress = ProgressBar(frame_count * (1 + extra_mask) + preview_frames + 1)
         directory = _output_directory(filename_prefix, save_output)
         sequence = kind in ("png", "exr")
         if sequence:
@@ -642,15 +693,14 @@ class VideoCombineWithMask:
             destination = directory / "frames" / f"%08d.{extension}"
         else:
             destination = directory / f"video.{extension}"
-        _encode(destination, kind, depth, images, mask, frame_rate, repetitions, ffmpeg)
+        _encode(destination, kind, depth, images, mask, frame_rate, repetitions, ffmpeg, progress=progress)
         paths = [str(destination)]
-        extra_mask = has_mask and (save_mask_sequence or (kind == "h264" and mask_mode == "separate_png"))
         if extra_mask:
             (directory / "mask").mkdir()
             mask_destination = directory / "mask" / "%08d.png"
-            _encode(mask_destination, "png", "16", images, mask, frame_rate, repetitions, ffmpeg, mask_only=True)
+            _encode(mask_destination, "png", "16", images, mask, frame_rate, repetitions, ffmpeg,
+                    mask_only=True, progress=progress)
             paths.append(str(mask_destination))
-        frame_count = len(images) * repetitions
         metadata = {"format": format, "bit_depth": depth, "fps": frame_rate,
                     "frame_count": frame_count, "alpha_convention": "mask=alpha",
                     "mask_sequence": len(paths) > 1, "files": paths}
@@ -660,13 +710,14 @@ class VideoCombineWithMask:
         preview = destination
         if kind != "vp9":
             preview = directory / "preview.webm"
-            _write_preview(preview, images, mask, frame_rate, ffmpeg)
+            _write_preview(preview, images, mask, frame_rate, ffmpeg, progress=progress)
         raw = [destination]
         if sequence:
             raw = [manifest, *(destination.with_name(destination.name % index) for index in range(frame_count))]
             if extra_mask:
                 raw.extend(mask_destination.with_name(mask_destination.name % index) for index in range(frame_count))
         ui = _media_ui(preview, raw, directory if sequence else None)
+        progress.update(1)
         return {"ui": ui, "result": (json.dumps(paths, ensure_ascii=False),)}
 
 

@@ -18,8 +18,16 @@ async function fixture(name, status = 200) {
     const elements = [];
     const uploads = [];
     const errors = [];
+    class Canvas {
+        getNodeMenuOptions(node) {
+            const options = [{content: "Existing item"}];
+            const extra = node.getExtraMenuOptions(this, options);
+            return Array.isArray(extra) ? [...extra, ...options] : options;
+        }
+    }
     const app = {
         registerExtension(value) { extension = value; },
+        canvas: new Canvas(),
         graph: {setDirtyCanvas() {}},
         extensionManager: {toast: {add(error) { errors.push(error); }}},
     };
@@ -55,9 +63,10 @@ async function fixture(name, status = 200) {
         constructor() { this.values = new Map(); }
         append(key, value) { this.values.set(key, value); }
     }
-    vm.runInNewContext(source, {__app: app, __api: api, document, FormData,
+    vm.runInNewContext(source, {__app: app, __api: api, document, FormData, LGraphCanvas: Canvas,
         crypto: {randomUUID: () => "test-group"}, URLSearchParams, console: {error() {}}}, {filename: file});
-    async function makeNode(name) {
+    extension.setup?.();
+    async function makeNode(name, installEarlierHook) {
         const combineWidgets = () => [
             {name: "format", value: PRORES},
             {name: "mask_mode", type: "combo", value: "error", options: {serialize: true}},
@@ -68,6 +77,7 @@ async function fixture(name, status = 200) {
                 this.dom = [];
                 this.size = [320, 300];
                 this.graph = app.graph;
+                this.canvas = app.canvas;
             }
             onNodeCreated() { return "created"; }
             onConfigure({format, maskMode, recreateWidgets}) {
@@ -91,6 +101,7 @@ async function fixture(name, status = 200) {
             setDirtyCanvas() {}
         }
         const original = Node.prototype.onNodeCreated;
+        installEarlierHook?.(Node);
         await extension.beforeRegisterNodeDef(Node, {name});
         return {node: new Node(), Node, original};
     }
@@ -140,11 +151,46 @@ const media = {preview: "/logiclite/video-mask/test/preview", raw: "/logiclite/v
 const output = {mask_video_previews: [media], mask_video_files: ["D:\\output\\shot\\manifest.json"]};
 
 function menuItems(node) {
-    const options = [{content: "Existing item"}];
-    assert.equal(node.getExtraMenuOptions(null, options), "menu");
+    const options = node.canvas.getNodeMenuOptions(node);
     assert.equal(options.at(-1).content, "Existing item");
-    return options.filter(Boolean).slice(0, -1);
+    return Array.from(options).filter(Boolean).slice(0, -1);
 }
+
+test("both preview menus survive chained third-party hooks and a wrapped node receiver", async () => {
+    const {makeNode} = await fixture(LOAD_ID);
+    for (const type of [LOAD_ID, SAVE_ID]) {
+        const {node, Node} = await makeNode(type, Node => {
+            Node.prototype.getExtraMenuOptions = function (_canvas, options) {
+                options.unshift({content: "Earlier extension"});
+                return [{content: "Earlier returned item"}];
+            };
+        });
+        const previous = Node.prototype.getExtraMenuOptions;
+        Node.prototype.getExtraMenuOptions = function (canvas, options) {
+            const extra = previous.call(new Proxy(this, {}), canvas, options);
+            return [...extra, {content: "Later extension"}];
+        };
+        node.onExecuted(output);
+        const items = menuItems(new Proxy(node, {}));
+        assert.deepEqual(Array.from(items, item => item.content), [
+            "Pause preview", "Hide preview", "Sync preview", "Download raw",
+            "Earlier returned item", "Later extension", "Earlier extension",
+        ]);
+        items[0].callback();
+        assert.equal(node.dom[0].container.children[0].paused, true);
+    }
+});
+
+test("a node-level menu replacement still keeps the loaded preview actions", async () => {
+    for (const type of [LOAD_ID, SAVE_ID]) {
+        const {node, Node} = await fixture(type);
+        Node.prototype.getExtraMenuOptions = () => [{content: "Replacement extension"}];
+        node.onExecuted(output);
+        assert.deepEqual(Array.from(menuItems(node), item => item.content), [
+            "Pause preview", "Hide preview", "Sync preview", "Download raw", "Replacement extension",
+        ]);
+    }
+});
 
 test("both nodes play muted looping video without path text and release old media", async () => {
     for (const type of [LOAD_ID, SAVE_ID]) {

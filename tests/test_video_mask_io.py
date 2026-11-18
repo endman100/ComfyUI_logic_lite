@@ -19,11 +19,29 @@ from aiohttp.test_utils import TestClient, TestServer
 import torch
 
 
+class RecordingProgressBar:
+    def __init__(self, total):
+        self.total = self.initial_total = total
+        self.current = 0
+        self.updates = []
+
+    def update_absolute(self, value, total=None):
+        if total is not None:
+            self.total = total
+        self.current = min(value, self.total)
+        self.updates.append((self.current, self.total))
+
+    def update(self, value):
+        self.update_absolute(self.current + value)
+
+
 ROOT = Path(__file__).resolve().parents[1]
 folders = ModuleType("folder_paths")
+utils = ModuleType("comfy.utils")
+utils.ProgressBar = RecordingProgressBar
 spec = importlib.util.spec_from_file_location("logic_lite_video_mask_io_test", ROOT / "nodes/video_mask_io.py")
 io = importlib.util.module_from_spec(spec)
-with patch.dict(sys.modules, {"folder_paths": folders}):
+with patch.dict(sys.modules, {"folder_paths": folders, "comfy.utils": utils}):
     spec.loader.exec_module(io)
 
 PRORES, XQ, VP9, PNG, EXR, H264 = io.FORMATS
@@ -107,6 +125,37 @@ class VideoMaskIOTests(unittest.TestCase):
         self.require_codec("prores_ks")
         paths, _, _ = self.roundtrip(PRORES, 0.012, 0.002)
         self.assertEqual(io._probe(paths[0], self.ffmpeg)["profile"], "4444")
+
+    def test_combine_reports_one_progress_bar_for_video_mask_and_preview(self):
+        self.require_codec("prores_ks")
+        self.require_codec("libvpx-vp9")
+        self.require_codec("png")
+        progress = RecordingProgressBar(16)
+        with patch.object(io, "ProgressBar", return_value=progress) as construct:
+            self.save(*synthetic(), format=PRORES, frame_rate=12, loop_count=1, save_mask_sequence=True)
+        # 6 video frames, 6 companion mask frames, 3 preview frames, and finalization.
+        construct.assert_called_once_with(16)
+        self.assertEqual(progress.updates, [(3, 16), (6, 16), (9, 16), (12, 16), (15, 16), (16, 16)])
+
+    def test_load_reports_progress_for_each_selected_video_frame(self):
+        self.require_codec("libvpx-vp9")
+        paths, _ = self.save(*synthetic(frames=7), format=VP9, frame_rate=12)
+        progress = RecordingProgressBar(4)
+        with patch.object(io, "ProgressBar", return_value=progress) as construct:
+            self.load(paths[0], skip_first_frames=1, select_every_nth=2, frame_load_cap=3)
+        construct.assert_called_once_with(4)
+        self.assertEqual(progress.updates, [(1, 4), (2, 4), (3, 4), (4, 4)])
+
+    def test_load_reports_progress_when_reading_sequence_frames(self):
+        self.require_codec("png")
+        self.require_codec("libvpx-vp9")
+        paths, _ = self.save(*synthetic(frames=6), format=PNG)
+        progress = RecordingProgressBar(4)
+        with patch.object(io, "ProgressBar", return_value=progress) as construct:
+            self.load(paths[0], skip_first_frames=1, select_every_nth=2, frame_load_cap=2)
+        # The loader reads the first frame for metadata and then the two selected frames.
+        construct.assert_called_once_with(4)
+        self.assertEqual(progress.updates, [(1, 4), (2, 4), (3, 4), (4, 4)])
 
     def test_roundtrip_prores_4444_xq(self):
         self.require_codec("prores_ks")

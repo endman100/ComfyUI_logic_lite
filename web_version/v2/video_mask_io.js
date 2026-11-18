@@ -4,7 +4,8 @@ import { api } from "../../scripts/api.js";
 const LOAD_ID = "Load Video With Mask (Upload) (endman100)";
 const SAVE_ID = "Video Combine With Mask (endman100)";
 const SEEK_BAR_HEIGHT = 14;
-const previews = new Map();
+const PREVIEW_STATE = Symbol("logicLiteVideoMaskPreview");
+const previews = new Set();
 
 async function uploadFiles(node, files) {
     if (!files.length) return;
@@ -92,12 +93,12 @@ function updatePlayback(state) {
 }
 
 function showPreviews(node, media) {
-    let state = previews.get(node);
+    let state = node[PREVIEW_STATE];
     if (!state && !media.length) return;
     if (!state) {
         const container = document.createElement("div");
         container.style.pointerEvents = "none";
-        state = {container, videos: [], raw: [], paused: false, hidden: false};
+        state = {node, container, videos: [], raw: [], paused: false, hidden: false};
         state.widget = node.addDOMWidget("mask_video_preview", "video", container, {
             serialize: false,
             getMinHeight: () => state.videos.reduce((sum, video) => {
@@ -105,7 +106,8 @@ function showPreviews(node, media) {
                 return sum + Math.min(220, Math.max(1, node.size[0] - 20) * ratio) + SEEK_BAR_HEIGHT;
             }, 0),
         });
-        previews.set(node, state);
+        node[PREVIEW_STATE] = state;
+        previews.add(state);
     }
     releaseVideos(state);
     state.raw = media.map(item => item.raw);
@@ -135,6 +137,45 @@ function downloadRaw(url) {
 
 app.registerExtension({
     name: "endman100.VideoMaskIO",
+    setup() {
+        // Let LiteGraph finish its node-level hooks before adding our entries.
+        const canvas = globalThis.LGraphCanvas.prototype;
+        const getNodeMenuOptions = canvas.getNodeMenuOptions;
+        canvas.getNodeMenuOptions = function (node) {
+            const options = getNodeMenuOptions.apply(this, arguments);
+            const state = node[PREVIEW_STATE];
+            if (!state?.videos.length) return options;
+            const items = [{
+                content: state.paused ? "Resume preview" : "Pause preview",
+                callback: () => {
+                    state.paused = !state.paused;
+                    updatePlayback(state);
+                },
+            }, {
+                content: state.hidden ? "Show preview" : "Hide preview",
+                callback: () => {
+                    state.hidden = !state.hidden;
+                    state.widget.hidden = state.container.hidden = state.hidden;
+                    updatePlayback(state);
+                    resizeNode(node);
+                },
+            }, {
+                content: "Sync preview",
+                callback: () => {
+                    for (const peer of previews) {
+                        if (peer.node.graph !== node.graph) continue;
+                        for (const video of peer.videos) video.currentTime = 0;
+                    }
+                },
+            }];
+            const downloads = state.raw.flatMap((url, index) => url ? [{
+                content: `Result ${index + 1}`, callback: () => downloadRaw(url),
+            }] : []);
+            if (downloads.length === 1) items.push({...downloads[0], content: "Download raw"});
+            if (downloads.length > 1) items.push({content: "Download raw", has_submenu: true, submenu: {options: downloads}});
+            return [...items, null, ...options];
+        };
+    },
     async beforeRegisterNodeDef(nodeType, nodeData) {
         if (nodeData.name !== LOAD_ID && nodeData.name !== SAVE_ID) return;
         if (nodeData.name === LOAD_ID) {
@@ -189,48 +230,13 @@ app.registerExtension({
             showPreviews(this, output?.mask_video_previews ?? []);
             return result;
         };
-        const menu = nodeType.prototype.getExtraMenuOptions;
-        nodeType.prototype.getExtraMenuOptions = function (canvas, options) {
-            const result = menu?.apply(this, arguments);
-            const state = previews.get(this);
-            if (!state?.videos.length) return result;
-            const items = [{
-                content: state.paused ? "Resume preview" : "Pause preview",
-                callback: () => {
-                    state.paused = !state.paused;
-                    updatePlayback(state);
-                },
-            }, {
-                content: state.hidden ? "Show preview" : "Hide preview",
-                callback: () => {
-                    state.hidden = !state.hidden;
-                    state.widget.hidden = state.container.hidden = state.hidden;
-                    updatePlayback(state);
-                    resizeNode(this);
-                },
-            }, {
-                content: "Sync preview",
-                callback: () => {
-                    for (const [node, peer] of previews) {
-                        if (node.graph !== this.graph) continue;
-                        for (const video of peer.videos) video.currentTime = 0;
-                    }
-                },
-            }];
-            const downloads = state.raw.flatMap((url, index) => url ? [{
-                content: `Result ${index + 1}`, callback: () => downloadRaw(url),
-            }] : []);
-            if (downloads.length === 1) items.push({...downloads[0], content: "Download raw"});
-            if (downloads.length > 1) items.push({content: "Download raw", has_submenu: true, submenu: {options: downloads}});
-            options.unshift(...items, null);
-            return result;
-        };
         const removed = nodeType.prototype.onRemoved;
         nodeType.prototype.onRemoved = function () {
-            const state = previews.get(this);
+            const state = this[PREVIEW_STATE];
             if (state) {
                 releaseVideos(state);
-                previews.delete(this);
+                previews.delete(state);
+                delete this[PREVIEW_STATE];
             }
             return removed?.apply(this, arguments);
         };
