@@ -3,6 +3,7 @@
 import asyncio
 from fractions import Fraction
 import glob
+from hashlib import sha256
 import json
 import math
 import os
@@ -37,6 +38,11 @@ LOAD_ID = "Load Video With Mask (Upload) (endman100)"
 SAVE_ID = "Video Combine With Mask (endman100)"
 _BUFFER_BYTES = 16 * 1024 * 1024
 _MEDIA_ROUTE = "/logiclite/video-mask"
+_VIDEO_EXTENSIONS = frozenset(".avi .flv .gif .m4v .mkv .mov .mp4 .mpeg .mpg .mts .m2ts .ts .webm .wmv".split())
+_SEQUENCE_EXTENSIONS = frozenset({".png", ".exr"})
+_PREVIEW_INPUT_FLAGS = ["-protocol_whitelist", "file", "-format_whitelist",
+                        "mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,avi,mpeg,mpegts,flv,asf,gif"]
+_load_preview_slots = asyncio.Semaphore(2)
 _media = {}
 
 
@@ -99,12 +105,8 @@ async def _serve_media(request):
 
 
 def _register_media_route(routes):
+    routes.post(_MEDIA_ROUTE + "/load-preview")(_serve_load_preview)
     routes.get(_MEDIA_ROUTE + r"/{token:[0-9a-f]{32}}/{kind:preview|raw}")(_serve_media)
-
-
-_prompt_server = getattr(getattr(sys.modules.get("server"), "PromptServer", None), "instance", None)
-if _prompt_server is not None:
-    _register_media_route(_prompt_server.routes)
 
 
 def find_ffmpeg():
@@ -146,16 +148,17 @@ def find_ffprobe(ffmpeg):
     return found
 
 
-def _probe(path, ffmpeg):
-    result = subprocess.run([find_ffprobe(ffmpeg), "-v", "error", "-select_streams", "v:0",
-                             "-show_streams", "-show_format", "-of", "json", str(path)], capture_output=True)
+def _probe(path, ffmpeg, input_flags=()):
+    result = subprocess.run([find_ffprobe(ffmpeg), "-v", "error",
+                             "-show_streams", "-show_format", "-of", "json", *input_flags, str(path)], capture_output=True)
     if result.returncode:
         raise RuntimeError("無法讀取媒體資訊：" + result.stderr.decode("utf-8", errors="replace"))
     metadata = json.loads(result.stdout)
     streams = metadata.get("streams", [])
-    if not streams:
+    stream = next((item for item in streams if item.get("codec_type") == "video"), None)
+    if stream is None:
         raise ValueError(f"檔案沒有影像軌：{path}")
-    stream = streams[0]
+    stream["audio"] = next((item for item in streams if item.get("codec_type") == "audio"), None)
     pixel_format = stream.get("pix_fmt", "")
     tags = {key.lower(): str(value) for key, value in stream.get("tags", {}).items()}
     stream["has_alpha"] = (any(part in pixel_format for part in ("rgba", "bgra", "argb", "abgr", "yuva", "gbrap"))
@@ -190,6 +193,21 @@ def _rate(value, name, allow_zero=False):
 
 def _natural_key(path):
     return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", str(path))]
+
+
+def _input_media():
+    root = Path(folder_paths.get_input_directory())
+    choices = []
+    for directory, _, names in os.walk(root):
+        relative = Path(directory).relative_to(root)
+        sequence = [name for name in names if Path(name).suffix.lower() in _SEQUENCE_EXTENSIONS]
+        choices.extend((relative / name).as_posix() for name in names
+                       if Path(name).suffix.lower() in _VIDEO_EXTENSIONS)
+        if relative.parts and sequence and len({Path(name).suffix.lower() for name in sequence}) == 1:
+            choices.append(relative.as_posix())
+        else:
+            choices.extend((relative / name).as_posix() for name in sequence)
+    return sorted(choices, key=_natural_key)
 
 
 def _sequence_signature(path):
@@ -238,9 +256,9 @@ def _sequence_signature(path):
         return attributes[b"dataWindow"], attributes[b"channels"]
 
 
-def _resolve_source(video):
+def _resolve_source(video, input_only=False):
     if not isinstance(video, str) or not video.strip():
-        raise ValueError("video 請填入已上傳檔名、影片路徑或 PNG／EXR 序列路徑")
+        raise ValueError("請先選擇或上傳影片／PNG／EXR 序列，或填入來源路徑")
     text = video.strip()
     if text.endswith((" [input]", " [output]", " [temp]")):
         text = folder_paths.get_annotated_filepath(text)
@@ -248,17 +266,20 @@ def _resolve_source(video):
     if not path.is_absolute():
         path = Path(folder_paths.get_input_directory()) / path
     path = path.resolve()
+    root = Path(folder_paths.get_input_directory()).resolve() if input_only else None
+    if root is not None and not path.is_relative_to(root):
+        raise PermissionError("即時預覽限 ComfyUI input 內的檔案；其他來源請執行工作流預覽")
     if path.is_dir():
         files = [item for item in path.iterdir() if item.suffix.lower() in (".png", ".exr") and item.is_file()]
     elif any(char in path.name for char in ("*", "?", "#", "%")):
         pattern = re.sub(r"%0?\d*d|#+", "*", str(path))
         files = [Path(item) for item in glob.glob(pattern) if Path(item).is_file()]
-    elif path.suffix.lower() in (".png", ".exr") and path.is_file():
+    elif path.suffix.lower() in _SEQUENCE_EXTENSIONS and path.is_file():
         match = re.fullmatch(r"(.*?)(\d+)", path.stem)
         if match:
             prefix, number = match.groups()
             files = [item for item in path.parent.iterdir()
-                     if item.suffix.lower() == path.suffix.lower()
+                     if item.is_file() and item.suffix.lower() == path.suffix.lower()
                      and re.fullmatch(re.escape(prefix) + r"\d+", item.stem)
                      and int(re.search(r"\d+$", item.stem).group()) >= int(number)]
         else:
@@ -272,19 +293,22 @@ def _resolve_source(video):
         raise ValueError("序列必須包含 PNG 或 EXR 影格")
     if len({item.suffix.lower() for item in files}) != 1:
         raise ValueError("同一序列不可混用 PNG 與 EXR；請指定檔名 pattern")
+    if root is not None and not all(item.resolve().is_relative_to(root) for item in files):
+        raise PermissionError("即時預覽的序列影格必須位於 ComfyUI input 內")
     return files[0], files
 
 
-def _load_sequence(first, files, sequence_fps, force_rate, skip, nth, cap, missing_alpha):
+def _load_sequence(first, files, sequence_fps, force_rate, skip, nth, cap, missing_alpha, preview_only=False):
     os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
     try:
         import cv2
     except (ImportError, OSError) as error:
         raise RuntimeError("PNG／EXR 序列需要 OpenCV（opencv-python）；不會降精度或改用 ffmpeg 解碼") from error
     signature = _sequence_signature(first)
-    for path in files:
-        if _sequence_signature(path) != signature:
-            raise ValueError(f"序列影格必須具有相同尺寸、位元深度與通道：{path}")
+    if not preview_only:
+        for path in files:
+            if _sequence_signature(path) != signature:
+                raise ValueError(f"序列影格必須具有相同尺寸、位元深度與通道：{path}")
 
     # 以影格中心的時間做最近鄰重採樣，再套用跳格、抽格與 cap；不插值原始像素。
     rate = force_rate or sequence_fps
@@ -296,9 +320,11 @@ def _load_sequence(first, files, sequence_fps, force_rate, skip, nth, cap, missi
         raise ValueError("選取後沒有影格；請檢查 skip_first_frames 與 frame_load_cap")
     unique, inverse = np.unique(indices, return_inverse=True)
     # The first frame also supplies the source metadata when the selection skips it.
-    progress = ProgressBar(len(unique) + int(unique[0] != 0) + 1)
+    progress = None if preview_only else ProgressBar(len(unique) + int(unique[0] != 0) + 1)
 
     def read(path):
+        if preview_only and _sequence_signature(path) != signature:
+            raise ValueError(f"序列影格必須具有相同尺寸、位元深度與通道：{path}")
         try:
             frame = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
         except cv2.error as error:
@@ -310,7 +336,13 @@ def _load_sequence(first, files, sequence_fps, force_rate, skip, nth, cap, missi
             raise ValueError(f"序列僅支援灰階、RGB 或 RGBA：{path}")
         if frame.dtype not in (np.uint8, np.uint16, np.float32):
             raise ValueError(f"不支援的序列像素型別 {frame.dtype}：{path}")
-        progress.update(1)
+        if progress is not None:
+            progress.update(1)
+        if preview_only and max(frame.shape[:2]) > 480:
+            height, width = frame.shape[:2]
+            scale = 480 / max(height, width)
+            frame = cv2.resize(frame, (max(1, round(width * scale)), max(1, round(height * scale))),
+                               interpolation=cv2.INTER_AREA)
         return frame
 
     first_frame = read(first)
@@ -363,8 +395,9 @@ def _decode(args, width, height, floating, ffmpeg, progress, has_alpha=True, gra
                     if read != frame_bytes:
                         raise RuntimeError("ffmpeg 傳回不完整影格，請確認序列尺寸與格式一致")
                     filled = end
-                    loaded = progress.current + 1
-                    progress.update_absolute(loaded, max(progress.total, loaded + 1))
+                    if progress is not None:
+                        loaded = progress.current + 1
+                        progress.update_absolute(loaded, max(progress.total, loaded + 1))
                 if not filled:
                     break
                 raw = chunk[:filled]
@@ -397,11 +430,32 @@ def _video_load_estimate(info, force_rate, skip, nth, cap):
     return min(cap, selected) if cap and selected else selected or cap
 
 
+def _preview_selection(rate, nth, cap):
+    sample, _ = _preview_sampling(rate / nth)
+    count = len(range(0, sample.stop, sample.step))
+    return nth * sample.step, min(count, (cap + sample.step - 1) // sample.step) if cap else count
+
+
+def _load_audio(path, info, start, duration, ffmpeg):
+    sample_rate, channels = int(info["sample_rate"]), int(info["channels"])
+    if sample_rate <= 0 or channels <= 0:
+        raise ValueError("音軌的採樣率或通道數無效")
+    command = [ffmpeg, "-v", "error", "-nostdin", "-ss", str(start), "-i", str(path),
+               "-t", str(duration), "-map", "0:a:0", "-c:a", "pcm_f32le", "-f", "f32le", "pipe:1"]
+    result = subprocess.run(command, capture_output=True)
+    if result.returncode:
+        raise RuntimeError("ffmpeg 音軌解碼失敗：" + result.stderr.decode("utf-8", errors="replace"))
+    if not result.stdout:
+        return None
+    pcm = np.frombuffer(result.stdout, dtype="<f4").reshape(-1, channels).T.copy()
+    return {"waveform": torch.from_numpy(pcm).unsqueeze(0), "sample_rate": sample_rate}
+
+
 class LoadVideoWithMask:
     @classmethod
     def INPUT_TYPES(cls):
         return {"required": {
-            "video": ("STRING", {"default": "", "tooltip": "上傳檔名、絕對路徑、序列資料夾、首格或 %08d／####／* pattern"}),
+            "video": (["", *_input_media()], {"tooltip": "從 ComfyUI input 選擇影片、序列目錄或首格"}),
             "frame_load_cap": ("INT", {"default": 0, "min": 0}),
             "skip_first_frames": ("INT", {"default": 0, "min": 0}),
             "select_every_nth": ("INT", {"default": 1, "min": 1}),
@@ -410,21 +464,37 @@ class LoadVideoWithMask:
             "custom_height": ("INT", {"default": 0, "min": 0}),
             "sequence_fps": ("FLOAT", {"default": 24.0, "min": 0.01}),
             "missing_alpha": (["ones", "error"], {"default": "ones"}),
+        }, "optional": {
+            "source_path": ("STRING", {"default": "", "tooltip": "選填，覆寫下拉選項。支援絕對路徑、序列首格或 %08d／####／* pattern"}),
         }}
 
-    RETURN_TYPES = ("IMAGE", "MASK", "INT", "FLOAT", "STRING")
-    RETURN_NAMES = ("images", "mask", "frame_count", "fps", "video_info")
+    RETURN_TYPES = ("IMAGE", "MASK", "INT", "FLOAT", "STRING", "AUDIO")
+    RETURN_NAMES = ("images", "mask", "frame_count", "fps", "video_info", "audio")
     FUNCTION = "load_video"
     CATEGORY = "video/mask"
     DESCRIPTION = "CPU 高精度影片載入；PNG16／EXR 序列使用 OpenCV IMREAD_UNCHANGED。MASK 直接等於 alpha（白色不透明），不反相；無 alpha 可選全白或報錯。"
 
     @classmethod
-    def IS_CHANGED(cls, **kwargs):
-        # 路徑可能指向可持續更新的整批序列，避免只依首格時間戳快取。
-        return float("nan")
+    def VALIDATE_INPUTS(cls, video, source_path=""):
+        try:
+            _resolve_source(source_path.strip() or video)
+        except (ValueError, OSError, RuntimeError) as error:
+            return str(error)
+        return True
+
+    @classmethod
+    def IS_CHANGED(cls, video, source_path=""):
+        try:
+            first, files = _resolve_source(source_path.strip() or video)
+            stats = [(str(path), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+                     for path in files or (first,) for stat in (path.stat(),)]
+        except (ValueError, OSError, RuntimeError):
+            return float("nan")
+        return sha256(json.dumps(stats).encode()).hexdigest()
 
     def load_video(self, video, frame_load_cap=0, skip_first_frames=0, select_every_nth=1,
-                   force_rate=0.0, custom_width=0, custom_height=0, sequence_fps=24.0, missing_alpha="ones"):
+                   force_rate=0.0, custom_width=0, custom_height=0, sequence_fps=24.0, missing_alpha="ones",
+                   source_path="", _preview_only=False):
         cap = _integer(frame_load_cap, "frame_load_cap", 0)
         skip = _integer(skip_first_frames, "skip_first_frames", 0)
         nth = _integer(select_every_nth, "select_every_nth", 1)
@@ -434,12 +504,22 @@ class LoadVideoWithMask:
         sequence_fps = _rate(sequence_fps, "sequence_fps")
         if missing_alpha not in ("ones", "error"):
             raise ValueError("missing_alpha 必須是 ones 或 error")
-        first, files = _resolve_source(video)
+        first, files = _resolve_source(source_path.strip() or video, input_only=_preview_only)
+        unmodified = not (cap or skip or nth != 1 or force_rate or width or height)
+        reuse_preview = False
         if files is not None:
-            rgba, info, progress = _load_sequence(first, files, sequence_fps, force_rate, skip, nth, cap, missing_alpha)
+            if _preview_only:
+                nth, cap = _preview_selection(force_rate or sequence_fps, nth, cap)
+            rgba, info, progress = _load_sequence(first, files, sequence_fps, force_rate, skip, nth, cap,
+                                                  missing_alpha, preview_only=_preview_only)
         else:
             ffmpeg = find_ffmpeg()
-            info = _probe(first, ffmpeg)
+            input_flags = _PREVIEW_INPUT_FLAGS if _preview_only else []
+            info = _probe(first, ffmpeg, input_flags)
+            reuse_preview = (unmodified and first.suffix.lower() == ".webm" and info.get("codec_name") == "vp9"
+                             and info["has_alpha"] and _media_file(first))
+            if _preview_only and reuse_preview:
+                return _media_ui(first, (first,))
         if not info["has_alpha"] and missing_alpha == "error":
             raise ValueError("來源沒有 alpha；若需要全白遮罩，請將 missing_alpha 設為 ones")
         source_fps = sequence_fps if files is not None else info["fps"]
@@ -453,7 +533,13 @@ class LoadVideoWithMask:
         display_w, display_h = (source_h, source_w) if turns % 2 else (source_w, source_h)
         width = width or (max(1, round(display_w * height / display_h)) if height else display_w)
         height = height or max(1, round(display_h * width / display_w))
-        fps = (force_rate or source_fps) / nth
+        rate = force_rate or source_fps
+        if _preview_only:
+            if files is None:
+                nth, cap = _preview_selection(rate, nth, cap)
+            scale = min(1, 480 / max(width, height))
+            width, height = max(1, round(width * scale)), max(1, round(height * scale))
+        fps = rate / nth
         floating = first.suffix.lower() == ".exr"
         filters = ([f"fps={force_rate}"] if force_rate else [])
         filters += [f"trim=start_frame={skip}", f"select=not(mod(n\\,{nth}))", f"setpts=N/({fps}*TB)"]
@@ -464,12 +550,12 @@ class LoadVideoWithMask:
                                      align_corners=False).movedim(1, -1)
             batches.append(rgba)
         else:
-            progress = ProgressBar(_video_load_estimate(info, force_rate, skip, nth, cap) + 1)
+            progress = None if _preview_only else ProgressBar(_video_load_estimate(info, force_rate, skip, nth, cap) + 1)
             inputs = ["-i", str(first)]
             # VP9 原生解碼器可能忽略 WebM alpha；明確使用 libvpx 解碼。
             if info.get("codec_name") == "vp9" and info["has_alpha"]:
                 inputs = ["-c:v", "libvpx-vp9", *inputs]
-            args = [*inputs, "-vf", ",".join(filters)]
+            args = [*input_flags, *inputs, "-vf", ",".join(filters)]
             if cap:
                 args += ["-frames:v", str(cap)]
             for batch in _decode(args, source_w, source_h, floating, ffmpeg, progress,
@@ -484,25 +570,45 @@ class LoadVideoWithMask:
             raise ValueError("選取後沒有影格；請檢查 skip_first_frames 與 frame_load_cap")
         rgba = torch.cat(batches, dim=0)
         alpha = rgba[..., 3].contiguous() if info["has_alpha"] else torch.ones_like(rgba[..., 0])
+        archive_root = Path(os.path.commonpath([path.parent for path in files])) if files else None
+        preview = first
+        if not reuse_preview:
+            preview = _output_directory("mask_video_preview", False) / "preview.webm"
+            _write_preview(preview, rgba, alpha, fps, find_ffmpeg() if files is not None else ffmpeg)
+        ui = _media_ui(preview, files or (first,), archive_root)
+        if _preview_only:
+            return ui
+        audio = (_load_audio(first, info["audio"], skip / rate, len(rgba) / fps, ffmpeg)
+                 if files is None and info["audio"] else None)
         metadata = {"source": str(first), "source_fps": source_fps, "fps": fps,
                     "frame_count": len(rgba), "width": width, "height": height,
                     "has_alpha": info["has_alpha"], "source_pix_fmt": info.get("pix_fmt"),
                     "source_rotation": rotation,
                     "decoder": "opencv_imread_unchanged" if files is not None else "ffmpeg",
-                    "alpha_convention": "mask=alpha", "sequence_files": len(files) if files else None}
-        if (files is None and first.suffix.lower() == ".webm" and info.get("codec_name") == "vp9"
-                and info["has_alpha"] and _media_file(first)):
-            preview = first
-        else:
-            directory = _output_directory("mask_video_preview", False)
-            preview = directory / "preview.webm"
-            _write_preview(preview, rgba, alpha, fps, find_ffmpeg() if files is not None else ffmpeg)
-        archive_root = Path(os.path.commonpath([path.parent for path in files])) if files else None
-        result = {"ui": _media_ui(preview, files or (first,), archive_root),
-                  "result": (rgba[..., :3].contiguous(), alpha, len(rgba), fps, json.dumps(metadata, ensure_ascii=False))}
+                    "alpha_convention": "mask=alpha", "sequence_files": len(files) if files else None,
+                    "has_audio": audio is not None}
+        result = {"ui": ui, "result": (rgba[..., :3].contiguous(), alpha, len(rgba), fps,
+                                         json.dumps(metadata, ensure_ascii=False), audio)}
         completed = progress.current + 1
         progress.update_absolute(completed, completed)
         return result
+
+
+async def _serve_load_preview(request):
+    fields = {"video", "source_path", "frame_load_cap", "skip_first_frames", "select_every_nth",
+              "force_rate", "custom_width", "custom_height", "sequence_fps", "missing_alpha"}
+    try:
+        settings = await request.json()
+        if (not isinstance(settings, dict) or not isinstance(settings.get("video"), str)
+                or not isinstance(settings.get("source_path", ""), str) or settings.keys() - fields):
+            raise ValueError("無效的影片預覽設定")
+        async with _load_preview_slots:
+            ui = await asyncio.to_thread(LoadVideoWithMask().load_video, **settings, _preview_only=True)
+    except PermissionError as error:
+        return web.json_response({"error": str(error)}, status=403)
+    except (TypeError, ValueError, OSError, RuntimeError) as error:
+        return web.json_response({"error": str(error)}, status=400)
+    return web.json_response(ui)
 
 
 def _validate_images(images, mask):
@@ -723,3 +829,7 @@ class VideoCombineWithMask:
 
 NODE_CLASS_MAPPINGS = {LOAD_ID: LoadVideoWithMask, SAVE_ID: VideoCombineWithMask}
 NODE_DISPLAY_NAME_MAPPINGS = {LOAD_ID: LOAD_ID, SAVE_ID: SAVE_ID}
+
+_prompt_server = getattr(getattr(sys.modules.get("server"), "PromptServer", None), "instance", None)
+if _prompt_server is not None:
+    _register_media_route(_prompt_server.routes)

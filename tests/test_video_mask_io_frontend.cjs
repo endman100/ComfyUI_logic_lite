@@ -18,6 +18,14 @@ async function fixture(name, status = 200) {
     const elements = [];
     const uploads = [];
     const errors = [];
+    const previewRequests = [];
+    const timers = new Map();
+    let nextTimer = 0;
+    async function flushPreviews() {
+        const pending = [...timers.values()];
+        timers.clear();
+        await Promise.all(pending.map(callback => callback()));
+    }
     class Canvas {
         getNodeMenuOptions(node) {
             const options = [{content: "Existing item"}];
@@ -34,6 +42,10 @@ async function fixture(name, status = 200) {
     const api = {
         apiURL(value) { return `/prefix${value}`; },
         async fetchApi(url, options) {
+            if (url === "/logiclite/video-mask/load-preview") {
+                previewRequests.push(JSON.parse(options.body));
+                return {ok: true, async json() { return {mask_video_previews: [media]}; }};
+            }
             uploads.push({url, options});
             return {ok: status === 200, status, async json() {
                 return {name: options.body.values.get("image").name, subfolder: options.body.values.get("subfolder")};
@@ -60,7 +72,9 @@ async function fixture(name, status = 200) {
         append(key, value) { this.values.set(key, value); }
     }
     vm.runInNewContext(source, {__app: app, __api: api, document, FormData, LGraphCanvas: Canvas,
-        crypto: {randomUUID: () => "test-group"}, URLSearchParams, console: {error() {}}}, {filename: file});
+        crypto: {randomUUID: () => "test-group"}, URLSearchParams, AbortController,
+        setTimeout(callback) { timers.set(++nextTimer, callback); return nextTimer; },
+        clearTimeout(timer) { timers.delete(timer); }, console: {error() {}}}, {filename: file});
     extension.setup?.();
     async function makeNode(name, installEarlierHook) {
         const combineWidgets = () => [
@@ -69,14 +83,21 @@ async function fixture(name, status = 200) {
         ];
         class Node {
             constructor() {
-                this.widgets = name === SAVE_ID ? combineWidgets() : [{name: "video", value: "original.mov"}];
+                this.widgets = name === SAVE_ID ? combineWidgets() : [
+                    {name: "video", value: "original.mov", options: {values: ["", "original.mov"]}},
+                    {name: "source_path", value: ""},
+                ];
                 this.dom = [];
                 this.size = [320, 300];
                 this.graph = app.graph;
                 this.canvas = app.canvas;
             }
             onNodeCreated() { return "created"; }
-            onConfigure({format, maskMode, recreateWidgets}) {
+            onConfigure({format, maskMode, recreateWidgets, video}) {
+                if (name === LOAD_ID) {
+                    this.widgets[0].value = video;
+                    return "configured";
+                }
                 if (recreateWidgets) this.widgets = combineWidgets();
                 this.widgets[0].value = format;
                 this.widgets[1].value = maskMode;
@@ -101,12 +122,13 @@ async function fixture(name, status = 200) {
         await extension.beforeRegisterNodeDef(Node, {name});
         return {node: new Node(), Node, original};
     }
-    return {...await makeNode(name), makeNode, elements, uploads, errors};
+    return {...await makeNode(name), makeNode, elements, uploads, errors, previewRequests, flushPreviews};
 }
 
-test("單檔上傳使用 ComfyUI 端點並保留伺服器子資料夾", async () => {
-    const {node, elements, uploads} = await fixture(LOAD_ID);
+test("單檔上傳使用 ComfyUI 端點並加入下拉選單", async () => {
+    const {node, elements, uploads, previewRequests, flushPreviews} = await fixture(LOAD_ID);
     assert.equal(node.onNodeCreated(), "created");
+    node.widgets[1].value = "old-source.mov";
     const button = node.widgets.at(-1);
     assert.equal(button.options.serialize, false);
     button.callback();
@@ -117,6 +139,11 @@ test("單檔上傳使用 ComfyUI 端點並保留伺服器子資料夾", async ()
     assert.equal(uploads[0].url, "/upload/image");
     assert.equal(uploads[0].options.body.values.get("overwrite"), "false");
     assert.equal(node.widgets[0].value, "logic_lite_test-group/alpha.mov");
+    assert.ok(node.widgets[0].options.values.includes(node.widgets[0].value));
+    assert.equal(node.widgets[1].value, "");
+    await flushPreviews();
+    assert.equal(previewRequests[0].video, "logic_lite_test-group/alpha.mov");
+    assert.equal(node.dom[0].container.children[0].tag, "video");
     assert.equal(input.removed, true);
 });
 
@@ -128,10 +155,12 @@ test("多張高精度影格上傳至同一唯一序列資料夾", async () => {
     await input.onchange();
     assert.equal(uploads.length, 2);
     assert.equal(node.widgets[0].value, "logic_lite_test-group");
+    assert.ok(node.widgets[0].options.values.includes(node.widgets[0].value));
 });
 
 test("上傳失敗或多部影片不會改寫已選路徑", async () => {
-    for (const [status, files] of [[500, [{name: "a.mov"}]], [200, [{name: "a.mov"}, {name: "b.mov"}]]]) {
+    for (const [status, files] of [[500, [{name: "a.mov"}]], [200, [{name: "a.mov"}, {name: "b.mov"}]],
+        [200, [{name: "a.png"}, {name: "b.exr"}]]]) {
         const {node, elements, errors} = await fixture(LOAD_ID, status);
         node.onNodeCreated(); node.widgets.at(-1).callback();
         const input = elements.at(-1);
@@ -141,6 +170,19 @@ test("上傳失敗或多部影片不會改寫已選路徑", async () => {
         assert.equal(errors.length, 1);
         assert.equal(input.removed, true);
     }
+});
+
+test("還原舊來源及變更選幀參數會更新預覽", async () => {
+    const {node, previewRequests, flushPreviews} = await fixture(LOAD_ID);
+    assert.equal(node.onConfigure({video: "legacy/sequence"}), "configured");
+    assert.ok(node.widgets[0].options.values.includes("legacy/sequence"));
+    for (const [name, value] of Object.entries({frame_load_cap: 3, skip_first_frames: 2, select_every_nth: 2, force_rate: 12})) {
+        node.widgets.push({name, value});
+        node.onWidgetChanged(name);
+    }
+    await flushPreviews();
+    assert.deepEqual(previewRequests, [{video: "legacy/sequence", source_path: "", frame_load_cap: 3,
+        skip_first_frames: 2, select_every_nth: 2, force_rate: 12}]);
 });
 
 const media = {preview: "/logiclite/video-mask/test/preview", raw: "/logiclite/video-mask/test/raw"};

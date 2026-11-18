@@ -4,13 +4,60 @@ import { api } from "../../scripts/api.js";
 const LOAD_ID = "Load Video With Mask (Upload) (endman100)";
 const SAVE_ID = "Video Combine With Mask (endman100)";
 const PREVIEW_STATE = Symbol("logicLiteVideoMaskPreview");
+const LOAD_PREVIEW = Symbol("logicLiteLoadPreviewRequest");
+const LOAD_SETTINGS = ["video", "source_path", "frame_load_cap", "skip_first_frames", "select_every_nth",
+    "force_rate", "custom_width", "custom_height", "sequence_fps", "missing_alpha"];
 const previews = new Set();
+
+function rememberVideo(widget, selected) {
+    const values = widget.options.values ?? [];
+    if (selected && !values.includes(selected)) widget.options.values = [...values, selected];
+}
+
+function stopLoadPreview(node) {
+    const request = node[LOAD_PREVIEW];
+    if (request) {
+        clearTimeout(request.timer);
+        request.controller.abort();
+        delete node[LOAD_PREVIEW];
+    }
+}
+
+function refreshLoadPreview(node) {
+    stopLoadPreview(node);
+    const settings = Object.fromEntries((node.widgets ?? []).filter(widget => LOAD_SETTINGS.includes(widget.name))
+        .map(widget => [widget.name, widget.value]));
+    if (!(settings.source_path?.trim() || settings.video)) {
+        showPreviews(node, []);
+        return;
+    }
+    const request = {controller: new AbortController()};
+    node[LOAD_PREVIEW] = request;
+    request.timer = setTimeout(async () => {
+        try {
+            const response = await api.fetchApi("/logiclite/video-mask/load-preview", {
+                method: "POST", headers: {"Content-Type": "application/json"},
+                body: JSON.stringify(settings), signal: request.controller.signal,
+            });
+            const data = await response.json();
+            if (node[LOAD_PREVIEW] !== request) return;
+            if (!response.ok && response.status !== 403) throw new Error(data.error ?? `HTTP ${response.status}`);
+            showPreviews(node, data.mask_video_previews ?? []);
+        } catch (error) {
+            if (node[LOAD_PREVIEW] === request) {
+                showPreviews(node, []);
+                app.extensionManager?.toast?.add({severity: "error", summary: "影片預覽失敗", detail: error.message});
+            }
+        }
+    }, 300);
+}
 
 async function uploadFiles(node, files) {
     if (!files.length) return;
     const sequence = files.length > 1;
-    if (sequence && !files.every(file => /\.(png|exr)$/i.test(file.name))) {
-        throw new Error("多檔上傳只接受 PNG／EXR 序列；影片請一次選取一個檔案。");
+    const extension = files[0].name.match(/\.(png|exr)$/i)?.[0].toLowerCase();
+    if (sequence && (!extension || !files.every(file => file.name.toLowerCase().endsWith(extension)))) {
+        throw new Error("多檔上傳只接受同一格式的 PNG 或 EXR 序列；影片請一次選取一個檔案。");
     }
     const token = globalThis.crypto?.randomUUID?.() ?? `${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
     const subfolder = `logic_lite_${token}`;
@@ -28,8 +75,13 @@ async function uploadFiles(node, files) {
     }
     const widget = node.widgets?.find(widget => widget.name === "video");
     if (widget) {
+        rememberVideo(widget, selected);
+        const previous = widget.value;
         widget.value = selected;
-        widget.callback?.(selected);
+        const path = node.widgets.find(widget => widget.name === "source_path");
+        if (path) path.value = "";
+        widget.callback?.(selected, app.canvas, node);
+        node.onWidgetChanged?.("video", selected, previous, widget);
         app.graph?.setDirtyCanvas(true, true);
     }
 }
@@ -159,7 +211,7 @@ app.registerExtension({
                 this.addWidget("button", "上傳影片／PNG／EXR 序列", null, () => {
                     const input = document.createElement("input");
                     input.type = "file";
-                    input.accept = ".mov,.webm,.mp4,.mkv,.avi,.png,.exr";
+                    input.accept = "video/*,.gif,.mkv,.mts,.m2ts,.ts,.png,.exr";
                     input.multiple = true;
                     input.hidden = true;
                     input.addEventListener("cancel", () => input.remove(), {once: true});
@@ -176,6 +228,20 @@ app.registerExtension({
                     document.body.append(input);
                     input.click();
                 }, {serialize: false});
+                return result;
+            };
+            const configured = nodeType.prototype.onConfigure;
+            nodeType.prototype.onConfigure = function () {
+                const result = configured?.apply(this, arguments);
+                const video = this.widgets?.find(widget => widget.name === "video");
+                if (video) rememberVideo(video, video.value);
+                refreshLoadPreview(this);
+                return result;
+            };
+            const changed = nodeType.prototype.onWidgetChanged;
+            nodeType.prototype.onWidgetChanged = function (name) {
+                const result = changed?.apply(this, arguments);
+                if (LOAD_SETTINGS.includes(name)) refreshLoadPreview(this);
                 return result;
             };
         } else {
@@ -206,6 +272,7 @@ app.registerExtension({
         };
         const removed = nodeType.prototype.onRemoved;
         nodeType.prototype.onRemoved = function () {
+            stopLoadPreview(this);
             const state = this[PREVIEW_STATE];
             if (state) {
                 releaseVideos(state);

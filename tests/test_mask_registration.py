@@ -43,6 +43,7 @@ def load_package():
     stubs["nodes"].NODE_CLASS_MAPPINGS = {}
     stubs["nodes"].MAX_RESOLUTION = 16384
     stubs["nodes"].LoraLoader = type("LoraLoader", (), {})
+    stubs["folder_paths"].get_input_directory = lambda: str(ROOT / "input")
     stubs["comfy.utils"].ProgressBar = object
     for name in ("SDXLClipModel", "SDXLRefinerClipModel", "SDXLClipG"):
         setattr(stubs["comfy.sdxl_clip"], name, type(name, (), {}))

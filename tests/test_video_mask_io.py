@@ -87,7 +87,7 @@ class VideoMaskIOTests(unittest.TestCase):
         return json.loads(result["result"][0]), result["ui"]
 
     def load(self, path, **kwargs):
-        return io.LoadVideoWithMask().load_video(str(path), **kwargs)["result"]
+        return io.LoadVideoWithMask().load_video(str(path), **kwargs)["result"][:5]
 
     def media(self, ui):
         self.assertEqual(set(ui), {"mask_video_previews"})
@@ -590,6 +590,69 @@ class VideoMaskIOTests(unittest.TestCase):
                     stream = io._probe(preview, self.ffmpeg)
                     self.assertEqual(stream["codec_name"], "vp9")
                     self.assertTrue(stream["has_alpha"])
+
+    def test_load_dropdown_validation_and_change_detection_for_sequence(self):
+        input_dir = self.root / "input"
+        group = input_dir / "sequence"
+        group.mkdir()
+        file = group / "0001.png"
+        file.write_bytes(b"header does not need to be decoded for validation")
+        (input_dir / "clip.MOV").touch()
+        (input_dir / "notes.txt").touch()
+        loader = io.LoadVideoWithMask
+        self.assertEqual(loader.INPUT_TYPES()["required"]["video"][0], ["", "clip.MOV", "sequence"])
+        self.assertTrue(loader.VALIDATE_INPUTS("sequence"))
+        self.assertTrue(loader.VALIDATE_INPUTS("", source_path=str(file)))
+        self.assertIn("找不到 video", loader.VALIDATE_INPUTS("absent.mp4"))
+        before = loader.IS_CHANGED("sequence")
+        self.assertEqual(loader.IS_CHANGED("sequence"), before)
+        file.write_bytes(b"changed file")
+        self.assertNotEqual(loader.IS_CHANGED("sequence"), before)
+        before = loader.IS_CHANGED("sequence")
+        (group / "0002.png").touch()
+        self.assertNotEqual(loader.IS_CHANGED("sequence"), before)
+
+    def test_live_vp9_preview_obeys_selection_and_excludes_outside_input(self):
+        self.require_codec("libvpx-vp9")
+        paths, _ = self.save(*synthetic(frames=12), format=VP9, frame_rate=12)
+        input_file = self.root / "input" / "source.webm"
+        input_file.write_bytes(Path(paths[0]).read_bytes())
+        routes = web.RouteTableDef()
+        io._register_media_route(routes)
+        app = web.Application()
+        app.add_routes(routes)
+
+        async def check_preview():
+            async with TestClient(TestServer(app)) as client:
+                route = io._MEDIA_ROUTE + "/load-preview"
+                async with client.post(route, json={"video": paths[0]}) as response:
+                    self.assertEqual(response.status, 403)
+                async with client.post(route, json={"video": input_file.name, "skip_first_frames": 1,
+                                                    "select_every_nth": 2, "force_rate": 6, "frame_load_cap": 2}) as response:
+                    self.assertEqual(response.status, 200, await response.text())
+                    _, preview = self.media(await response.json())
+                    self.assertNotEqual(preview, input_file)
+                    self.assertEqual(self.load(preview)[2:4], (2, 3))
+        asyncio.run(check_preview())
+        result = io.LoadVideoWithMask().load_video(input_file.name, skip_first_frames=1, frame_load_cap=2)
+        _, preview = self.media(result["ui"])
+        self.assertNotEqual(preview, input_file)
+        self.assertEqual(self.load(preview)[2], 2)
+
+    def test_load_audio_is_trimmed_to_the_selected_video_timeline(self):
+        self.require_codec("libx264")
+        self.require_codec("aac")
+        self.require_codec("libvpx-vp9")
+        path = self.root / "input" / "audio.mp4"
+        subprocess.run([self.ffmpeg, "-v", "error", "-f", "lavfi", "-i", "color=size=32x24:rate=12:duration=2",
+                        "-f", "lavfi", "-i", "sine=sample_rate=48000:duration=2", "-c:v", "libx264",
+                        "-c:a", "aac", str(path)], check=True)
+        results = io.LoadVideoWithMask().load_video(path.name, skip_first_frames=6, frame_load_cap=3)["result"]
+        self.assertEqual(results[2:4], (3, 12))
+        self.assertTrue(json.loads(results[4])["has_audio"])
+        audio = results[5]
+        self.assertEqual(audio["sample_rate"], 48000)
+        self.assertEqual(audio["waveform"].shape, (1, 1, 12000))
 
     def test_media_route_serves_exact_files_and_sequence_zip(self):
         images, alpha = synthetic()
