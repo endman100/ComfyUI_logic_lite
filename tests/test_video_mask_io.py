@@ -1,6 +1,8 @@
 """以真實 CPU ffmpeg／OpenCV 檢查影片、alpha 與高精度序列，不啟動 ComfyUI。"""
 
+import asyncio
 import importlib.util
+from io import BytesIO
 import json
 import os
 from pathlib import Path
@@ -10,7 +12,10 @@ import tempfile
 from types import ModuleType
 import unittest
 from unittest.mock import patch
+from zipfile import ZipFile
 
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
 import torch
 
 
@@ -44,6 +49,7 @@ class VideoMaskIOTests(unittest.TestCase):
         print(f"I/O CPU ffmpeg: {cls.ffmpeg}; ffprobe: {cls.ffprobe}", flush=True)
 
     def setUp(self):
+        io._media.clear()
         self.scratch = tempfile.TemporaryDirectory(prefix="logic_lite_io_test_")
         self.addCleanup(self.scratch.cleanup)
         self.root = Path(self.scratch.name)
@@ -63,7 +69,16 @@ class VideoMaskIOTests(unittest.TestCase):
         return json.loads(result["result"][0]), result["ui"]
 
     def load(self, path, **kwargs):
-        return io.LoadVideoWithMask().load_video(str(path), **kwargs)
+        return io.LoadVideoWithMask().load_video(str(path), **kwargs)["result"]
+
+    def media(self, ui):
+        self.assertEqual(set(ui), {"mask_video_previews"})
+        item, = ui["mask_video_previews"]
+        self.assertEqual(set(item), {"preview", "raw"})
+        self.assertRegex(item["preview"], r"^/logiclite/video-mask/[0-9a-f]{32}/preview$")
+        if item["raw"] is not None:
+            self.assertEqual(item["raw"], item["preview"].removesuffix("preview") + "raw")
+        return item, io._media[item["preview"].split("/")[-2]][0]
 
     def roundtrip(self, format, rgb_tolerance, alpha_tolerance):
         images, alpha = synthetic()
@@ -79,7 +94,13 @@ class VideoMaskIOTests(unittest.TestCase):
         print(f"{format}: RGB max={rgb_error:.9g}; alpha max={alpha_error:.9g}", flush=True)
         self.assertLessEqual(rgb_error, rgb_tolerance)
         self.assertLessEqual(alpha_error, alpha_tolerance)
-        self.assertTrue((self.root / "output" / ui["images"][0]["subfolder"] / "preview.png").is_file())
+        _, preview = self.media(ui)
+        self.assertTrue(preview.is_file())
+        expected = Path(paths[0]) if format == VP9 else Path(paths[-1]).with_name("preview.webm")
+        self.assertEqual(preview, expected)
+        stream = io._probe(preview, self.ffmpeg)
+        self.assertEqual(stream["codec_name"], "vp9")
+        self.assertTrue(stream["has_alpha"])
         return paths, rgb, mask
 
     def test_roundtrip_prores_4444(self):
@@ -99,7 +120,7 @@ class VideoMaskIOTests(unittest.TestCase):
         for format in (PRORES, XQ):
             with patch.object(io.subprocess, "Popen", wraps=subprocess.Popen) as popen:
                 paths, _ = self.save(images, alpha, format=format, bit_depth="12")
-            command = popen.call_args.args[0]
+            command = popen.call_args_list[0].args[0]
             self.assertEqual(command[command.index("-pixel_format") + 1], "rgba64le")
             self.assertEqual(command[command.index("-pix_fmt") + 1], "yuva444p12le")
             self.assertEqual(command[command.index("-alpha_bits") + 1], "16")
@@ -123,8 +144,7 @@ class VideoMaskIOTests(unittest.TestCase):
         for format, codec in ((PNG, "png"), (EXR, "exr")):
             self.require_codec(codec)
             paths, _ = self.save(images, alpha, format=format)
-            with (patch.object(io, "find_ffmpeg", side_effect=AssertionError("序列不可呼叫 ffmpeg")),
-                  patch.object(io, "_probe", side_effect=AssertionError("序列不可呼叫 ffprobe")),
+            with (patch.object(io, "_probe", side_effect=AssertionError("序列不可呼叫 ffprobe")),
                   patch.object(io, "_decode", side_effect=AssertionError("序列不可走 ffmpeg 解碼")),
                   patch.object(cv2, "imread", wraps=cv2.imread) as imread):
                 rgb, mask, _, _, info = self.load(paths[0])
@@ -177,7 +197,8 @@ class VideoMaskIOTests(unittest.TestCase):
 
     def test_roundtrip_vp9_alpha(self):
         self.require_codec("libvpx-vp9")
-        self.roundtrip(VP9, 0.04, 1 / 255 + 0.0001)
+        paths, _, _ = self.roundtrip(VP9, 0.04, 1 / 255 + 0.0001)
+        self.assertFalse(Path(paths[0]).with_name("preview.webm").exists())
 
     def test_roundtrip_png16(self):
         self.require_codec("png")
@@ -278,7 +299,7 @@ class VideoMaskIOTests(unittest.TestCase):
             self.save(images, alpha, format=H264)
         for mode in ("separate_png", "ignore"):
             paths, ui = self.save(images, alpha, format=H264, mask_mode=mode)
-            self.assertIn("mask_videos", ui)
+            self.assertTrue(self.media(ui)[1].is_file())
             self.assertEqual(len(paths), 3 if mode == "separate_png" else 2)
             if mode == "separate_png":
                 _, mask, *_ = self.load(paths[1], missing_alpha="error")
@@ -392,6 +413,7 @@ class VideoMaskIOTests(unittest.TestCase):
         for mask in (static, static.unsqueeze(0), static[None, ..., None]):
             with self.subTest(shape=tuple(mask.shape)):
                 with (patch.object(io, "_BUFFER_BYTES", 2 * 24 * 32 * 4 * 4),
+                      patch.object(io, "_write_preview"),
                       patch.object(io.subprocess, "Popen") as popen):
                     process = popen.return_value
                     process.wait.return_value = process.poll.return_value = 0
@@ -429,7 +451,7 @@ class VideoMaskIOTests(unittest.TestCase):
         rgb, _, count, *_ = self.load(paths[0])
         self.assertEqual(count, 6)
         torch.testing.assert_close(rgb, images.repeat(2, 1, 1, 1), atol=0.5 / 65535 + 1e-7, rtol=0)
-        self.assertEqual(ui["images"][0]["type"], "temp")
+        self.assertTrue(self.media(ui)[1].is_relative_to(self.root / "temp"))
         self.assertTrue(Path(paths[0]).is_relative_to(self.root / "temp"))
         self.assertEqual(json.loads(Path(paths[-1]).read_text())["frame_count"], 6)
 
@@ -480,6 +502,97 @@ class VideoMaskIOTests(unittest.TestCase):
             paths, _ = self.save(images, alpha)
             rgb, *_ = self.load(paths[0])
         torch.testing.assert_close(rgb, images, atol=0.5 / 65535 + 1e-7, rtol=0)
+
+    def test_preview_caps_size_rate_and_duration_and_keeps_broadcast_alpha(self):
+        images = torch.full((3, 241, 641, 3), 0.4)
+        alpha = torch.full((1, 241, 641), 0.25)
+        paths, ui = self.save(images, alpha, format=PRORES, frame_rate=15)
+        _, preview = self.media(ui)
+        self.assertEqual(preview, Path(paths[0]).with_name("preview.webm"))
+        stream = io._probe(preview, self.ffmpeg)
+        self.assertEqual((stream["width"], stream["height"]), (480, 180))
+        _, masks, count, _, _ = self.load(preview)
+        self.assertEqual(count, 3)
+        torch.testing.assert_close(masks, torch.full_like(masks, 0.25), atol=0.02, rtol=0)
+
+        long_preview = self.root / "long.webm"
+        io._write_preview(long_preview, torch.zeros((540, 8, 8, 3)), None, 60, self.ffmpeg)
+        _, _, count, fps, _ = self.load(long_preview)
+        self.assertEqual((count, fps), (120, 15))
+
+    def test_load_transcodes_prores_and_reuses_alpha_webm(self):
+        images, alpha = synthetic()
+        for format in (PRORES, VP9):
+            with self.subTest(format=format):
+                paths, _ = self.save(images, alpha, format=format)
+                input_file = self.root / "input" / Path(paths[0]).name
+                input_file.write_bytes(Path(paths[0]).read_bytes())
+                with patch.object(io, "_write_preview", wraps=io._write_preview) as write_preview:
+                    result = io.LoadVideoWithMask().load_video(input_file.name)
+                item, preview = self.media(result["ui"])
+                self.assertIsNotNone(item["raw"])
+                self.assertEqual(result["result"][2], len(images))
+                if format == VP9:
+                    write_preview.assert_not_called()
+                    self.assertEqual(preview, input_file)
+                else:
+                    write_preview.assert_called_once()
+                    self.assertTrue(preview.is_relative_to(self.root / "temp"))
+                    stream = io._probe(preview, self.ffmpeg)
+                    self.assertEqual(stream["codec_name"], "vp9")
+                    self.assertTrue(stream["has_alpha"])
+
+    def test_media_route_serves_exact_files_and_sequence_zip(self):
+        images, alpha = synthetic()
+        paths, ui = self.save(images, alpha, format=PRORES)
+        file_item, preview = self.media(ui)
+        sequence_paths, ui = self.save(images, alpha, format=PNG, save_mask_sequence=True)
+        sequence_item, _ = self.media(ui)
+        sequence_directory = Path(sequence_paths[-1]).parent
+        (sequence_directory / "unrelated.txt").write_text("private")
+        loaded = io.LoadVideoWithMask().load_video(str(sequence_directory / "frames"))
+        loaded_item, _ = self.media(loaded["ui"])
+        routes = web.RouteTableDef()
+        io._register_media_route(routes)
+        app = web.Application()
+        app.add_routes(routes)
+
+        async def check_routes():
+            async with TestClient(TestServer(app)) as client:
+                async with client.get(file_item["preview"], headers={"Range": "bytes=0-15"}) as response:
+                    self.assertEqual(response.status, 206)
+                    self.assertEqual(response.content_type, "video/webm")
+                    self.assertEqual(await response.read(), preview.read_bytes()[:16])
+                async with client.get(file_item["raw"]) as response:
+                    self.assertEqual(response.status, 200)
+                    self.assertIn('filename="video.mov"', response.headers["Content-Disposition"])
+                    self.assertEqual(await response.read(), Path(paths[0]).read_bytes())
+                for url, root, expected in (
+                    (sequence_item["raw"], sequence_directory,
+                     {"manifest.json", *(f"{part}/{frame:08}.png" for part in ("frames", "mask") for frame in range(3))}),
+                    (loaded_item["raw"], sequence_directory / "frames", {f"{frame:08}.png" for frame in range(3)}),
+                ):
+                    async with client.get(url) as response:
+                        self.assertEqual(response.status, 200)
+                        self.assertEqual(response.content_type, "application/zip")
+                        self.assertIn(".zip", response.headers["Content-Disposition"])
+                        with ZipFile(BytesIO(await response.read())) as archive:
+                            self.assertEqual(set(archive.namelist()), expected)
+                            for name in expected:
+                                self.assertEqual(archive.read(name), (root / name).read_bytes())
+                async with client.get(f"{io._MEDIA_ROUTE}/{'0' * 32}/raw?path={paths[0]}") as response:
+                    self.assertEqual(response.status, 404)
+
+        asyncio.run(check_routes())
+
+    def test_external_load_gets_a_local_preview_without_a_raw_route(self):
+        external = self.root / "external.webm"
+        paths, _ = self.save(*synthetic(), format=VP9)
+        external.write_bytes(Path(paths[0]).read_bytes())
+        result = io.LoadVideoWithMask().load_video(str(external))
+        item, preview = self.media(result["ui"])
+        self.assertIsNone(item["raw"])
+        self.assertTrue(preview.is_relative_to(self.root / "temp"))
 
 
 class VideoIORegistrationTests(unittest.TestCase):

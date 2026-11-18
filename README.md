@@ -26,7 +26,11 @@ CPU checks: `python -B tests/run_cpu_tests.py --comfy-root /path/to/ComfyUI` and
 
 RGBA 影片走 16-bit pipe，PNG16 不經 Pillow 量化；OpenCV EXR32 保留 float32、負值與 HDR 範圍，不套用色彩轉換；支援一般單層 scanline EXR，不支援 tiled／deep／multipart。整數格式限制至 0..1。ProRes 4444／XQ 使用 `rgba64le → -c:v prores_ks -profile:v 4444/4444xq -pix_fmt yuva444p12le -alpha_bits 16`，**不強制 BT.709 scale／range 轉換或色彩標籤**；不會先降成 RGBA8。`bit_depth=12` 是要求值，不保證編碼器保留完整 12-bit：本機 ffmpeg 7.1.5 的 `prores_ks` 會警告並自動改用 `yuva444p10le`，解碼顯示 `yuva444p12le` 也不能證明全程 12-bit 精度。3 格 32×24 合成樣本的兩種 profile 往返最大差皆為 RGB 約 0.00170711、alpha 約 0.00122583（約 80/65535），均非數值無損；XQ 名稱也不代表已做 HDR 色彩管理。VP9 alpha 為 8-bit、4:2:0，讀取時強制 libvpx 解碼；VP9／H.264 需要偶數寬高。這些節點只處理影像，未保留音訊。
 
-輸出在 ComfyUI output（`save_output=false` 則 temp）下的唯一資料夾，不覆寫既有檔案；含主檔／序列、fps 與路徑的 `manifest.json`，並回傳 JSON 檔案路徑。MP4／WebM 提供瀏覽器預覽，其餘提供縮圖及路徑；僅縮圖是 8-bit，不影響母檔。ffmpeg 依序尋找 `LOGIC_LITE_FFMPEG` 明確覆寫 → 選填 imageio-ffmpeg → `VHS_FORCE_FFMPEG_PATH`／已載入 VHS 的路徑 → PATH；不匯入 VHS。ffprobe 使用 `LOGIC_LITE_FFPROBE` → ffmpeg 同目錄 → PATH。需有 CPU `prores_ks`、`libvpx-vp9`、`libx264`、`png`、`exr` 編碼器；缺少時顯示 ffmpeg 錯誤。編碼以有界批次串流到 pipe；載入仍需容納最終 IMAGE／MASK 批次，可用 cap 限制記憶體。
+輸出在 ComfyUI output（`save_output=false` 則 temp）下的唯一資料夾，含主檔／序列、fps 與路徑的 `manifest.json`，並回傳 JSON 檔案路徑。
+
+執行後，兩個節點都會在節點內靜音循環播放 VP9 alpha WebM。VP9 alpha 輸出與位於 ComfyUI 輸入、輸出或暫存目錄的 VP9 alpha WebM 來源可直接播放。其他格式取前 8 秒（至少一格），以長邊最多 480 像素、最多 15 fps、300 kb/s 目標碼率編碼，保留遮罩的 alpha。載入轉碼使用套用選幀和縮放後的批次。右鍵選單可暫停、隱藏、將同一工作流程的預覽一起回到開頭，或下載原始檔。合成的序列 ZIP 包含影格、manifest 與另存的遮罩序列。載入的序列 ZIP 包含來源影格。下載限當前伺服器工作階段中由這兩個節點登記的 ComfyUI 輸入、輸出或暫存檔案。
+
+ffmpeg 依序尋找 `LOGIC_LITE_FFMPEG` 明確覆寫 → 選填 imageio-ffmpeg → `VHS_FORCE_FFMPEG_PATH`／已載入 VHS 的路徑 → PATH；不匯入 VHS。ffprobe 使用 `LOGIC_LITE_FFPROBE` → ffmpeg 同目錄 → PATH。需有 CPU `prores_ks`、`libvpx-vp9`、`libx264`、`png`、`exr` 編碼器；缺少時顯示 ffmpeg 錯誤。編碼以有界批次串流到 pipe；載入仍需容納最終 IMAGE／MASK 批次，可用 cap 限制記憶體。
 
 授權參考：本儲存庫未找到授權檔；VideoHelperSuite 為 GPLv3。本次僅參考其功能與介面，未複製 GPL Python／JS 程式碼。I/O 測試可併入既有 CPU runner；前端測試用 `node --test tests/*.cjs`。
 

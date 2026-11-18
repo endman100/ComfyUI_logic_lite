@@ -1,5 +1,6 @@
 """獨立實作的高精度影片／遮罩 I/O，不依賴 VideoHelperSuite。"""
 
+import asyncio
 from fractions import Fraction
 import glob
 import json
@@ -12,7 +13,11 @@ import struct
 import subprocess
 import sys
 import tempfile
+from uuid import uuid4
+from zipfile import ZipFile
 
+from aiohttp import web
+from aiohttp.helpers import content_disposition_header
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -30,6 +35,75 @@ FORMATS = {
 LOAD_ID = "Load Video With Mask (Upload) (endman100)"
 SAVE_ID = "Video Combine With Mask (endman100)"
 _BUFFER_BYTES = 16 * 1024 * 1024
+_MEDIA_ROUTE = "/logiclite/video-mask"
+_media = {}
+
+
+def _media_file(path):
+    roots = (folder_paths.get_input_directory(), folder_paths.get_output_directory(), folder_paths.get_temp_directory())
+    return (path.is_file() and path.resolve() == path
+            and any(path.is_relative_to(Path(root).resolve()) for root in roots))
+
+
+def _media_ui(preview, raw, archive_root=None):
+    token = uuid4().hex
+    if not all(_media_file(path) for path in raw):
+        raw = ()
+    _media[token] = (preview, tuple(raw), archive_root)
+    url = f"{_MEDIA_ROUTE}/{token}"
+    return {"mask_video_previews": [{"preview": f"{url}/preview", "raw": f"{url}/raw" if raw else None}]}
+
+
+def _zip_sequence(files, root):
+    archive = tempfile.TemporaryFile()
+    try:
+        with ZipFile(archive, "w") as output:
+            for path in files:
+                if not _media_file(path):
+                    raise web.HTTPNotFound()
+                output.write(path, path.relative_to(root).as_posix())
+        archive.seek(0)
+        return archive
+    except BaseException:
+        archive.close()
+        raise
+
+
+async def _serve_media(request):
+    media = _media.get(request.match_info["token"])
+    if media is None:
+        raise web.HTTPNotFound()
+    preview, raw, archive_root = media
+    if request.match_info["kind"] == "preview":
+        if not _media_file(preview):
+            raise web.HTTPNotFound()
+        return web.FileResponse(preview, headers={"Content-Type": "video/webm", "X-Content-Type-Options": "nosniff"})
+    if not raw:
+        raise web.HTTPNotFound()
+    filename = f"{archive_root.name or 'sequence'}.zip" if archive_root is not None else raw[0].name
+    headers = {"Content-Disposition": content_disposition_header("attachment", filename=filename),
+               "X-Content-Type-Options": "nosniff"}
+    if archive_root is None:
+        if not _media_file(raw[0]):
+            raise web.HTTPNotFound()
+        return web.FileResponse(raw[0], headers=headers)
+    with await asyncio.to_thread(_zip_sequence, raw, archive_root) as archive:
+        response = web.StreamResponse(headers={**headers, "Content-Type": "application/zip"})
+        response.content_length = os.fstat(archive.fileno()).st_size
+        await response.prepare(request)
+        if request.method != "HEAD":
+            while chunk := archive.read(1024 * 1024):
+                await response.write(chunk)
+        return response
+
+
+def _register_media_route(routes):
+    routes.get(_MEDIA_ROUTE + r"/{token:[0-9a-f]{32}}/{kind:preview|raw}")(_serve_media)
+
+
+_prompt_server = getattr(getattr(sys.modules.get("server"), "PromptServer", None), "instance", None)
+if _prompt_server is not None:
+    _register_media_route(_prompt_server.routes)
 
 
 def find_ffmpeg():
@@ -381,7 +455,16 @@ class LoadVideoWithMask:
                     "source_rotation": rotation,
                     "decoder": "opencv_imread_unchanged" if files is not None else "ffmpeg",
                     "alpha_convention": "mask=alpha", "sequence_files": len(files) if files else None}
-        return rgba[..., :3].contiguous(), alpha, len(rgba), fps, json.dumps(metadata, ensure_ascii=False)
+        if (files is None and first.suffix.lower() == ".webm" and info.get("codec_name") == "vp9"
+                and info["has_alpha"] and _media_file(first)):
+            preview = first
+        else:
+            directory = _output_directory("mask_video_preview", False)
+            preview = directory / "preview.webm"
+            _write_preview(preview, rgba, alpha, fps, find_ffmpeg() if files is not None else ffmpeg)
+        archive_root = Path(os.path.commonpath([path.parent for path in files])) if files else None
+        return {"ui": _media_ui(preview, files or (first,), archive_root),
+                "result": (rgba[..., :3].contiguous(), alpha, len(rgba), fps, json.dumps(metadata, ensure_ascii=False))}
 
 
 def _validate_images(images, mask):
@@ -405,7 +488,7 @@ def _validate_images(images, mask):
     return mask
 
 
-def _rgba_chunks(images, mask, repetitions, half=False, mask_only=False):
+def _rgba_chunks(images, mask, repetitions, half=False, mask_only=False, preview_size=None):
     count, height, width = images.shape[:3]
     batch_size = max(1, _BUFFER_BYTES // (height * width * 4 * 4))
     # 只依有界 I/O 批次與播放次數迭代；轉換在整個批次上向量化，不逐像素處理。
@@ -418,26 +501,36 @@ def _rgba_chunks(images, mask, repetitions, half=False, mask_only=False):
                 alpha = images[start:start + batch_size, ..., 3:].detach().to(device="cpu", dtype=torch.float32)
             else:
                 alpha = torch.ones_like(rgb[..., :1])
-            if not torch.isfinite(rgb).all() or not torch.isfinite(alpha).all():
+            if preview_size is None and (not torch.isfinite(rgb).all() or not torch.isfinite(alpha).all()):
                 raise ValueError("images 與 mask 不可包含 NaN 或 Infinity")
             alpha = alpha.clamp(0, 1)
-            rgba = torch.cat((alpha.expand_as(rgb) if mask_only else rgb, alpha), dim=-1).numpy()
+            rgba = torch.cat((alpha.expand_as(rgb) if mask_only else rgb, alpha), dim=-1)
+            if preview_size is not None:
+                rgba.nan_to_num_().clamp_(0, 1)
+                if preview_size != (height, width):
+                    rgba = F.interpolate(rgba.movedim(-1, 1), size=preview_size, mode="bilinear",
+                                         align_corners=False).movedim(1, -1)
+            rgba = rgba.numpy()
             if half and np.any(np.abs(rgba) > np.finfo(np.float16).max):
                 raise ValueError("EXR half 數值超過 float16 範圍；請改用 bit_depth=float")
             yield rgba.astype(np.float16).astype(np.float32) if half else rgba
 
 
-def _encode(destination, kind, depth, images, mask, frame_rate, repetitions, ffmpeg, mask_only=False):
-    height, width = images.shape[1:3]
+def _encode(destination, kind, depth, images, mask, frame_rate, repetitions, ffmpeg, mask_only=False, preview_size=None):
+    height, width = preview_size or images.shape[1:3]
     floating = kind == "exr"
-    raw_format = "gbrapf32le" if floating else "rgba64le"
+    raw_format = "rgba" if kind == "preview" else ("gbrapf32le" if floating else "rgba64le")
     command = [ffmpeg, "-v", "error", "-nostdin", "-n", "-f", "rawvideo", "-pixel_format", raw_format,
                "-video_size", f"{width}x{height}", "-framerate", str(frame_rate), "-i", "pipe:0", "-an"]
     if kind in ("prores", "prores_xq"):
         command += ["-c:v", "prores_ks", "-profile:v", "4444xq" if kind == "prores_xq" else "4444",
                     "-pix_fmt", "yuva444p12le", "-alpha_bits", "16"]
-    elif kind == "vp9":
-        command += ["-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p", "-lossless", "1", "-auto-alt-ref", "0"]
+    elif kind in ("vp9", "preview"):
+        command += ["-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p", "-auto-alt-ref", "0"]
+        if kind == "preview":
+            command += ["-deadline", "realtime", "-cpu-used", "6", "-b:v", "300k", "-crf", "38"]
+        else:
+            command += ["-lossless", "1"]
     elif kind == "png":
         command += ["-c:v", "png", "-pix_fmt", "rgba64be", "-start_number", "0"]
     elif kind == "exr":
@@ -450,9 +543,12 @@ def _encode(destination, kind, depth, images, mask, frame_rate, repetitions, ffm
         process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=log)
         try:
             try:
-                for rgba in _rgba_chunks(images, mask, repetitions, half=depth == "half", mask_only=mask_only):
+                for rgba in _rgba_chunks(images, mask, repetitions, half=depth == "half", mask_only=mask_only,
+                                         preview_size=preview_size):
                     if floating:
                         data = np.ascontiguousarray(rgba[..., [1, 2, 0, 3]].transpose(0, 3, 1, 2), dtype="<f4")
+                    elif kind == "preview":
+                        data = np.rint(rgba * 255).astype(np.uint8)
                     else:
                         data = np.rint(np.clip(rgba, 0, 1) * 65535).astype("<u2")
                     process.stdin.write(data.tobytes())
@@ -472,6 +568,16 @@ def _encode(destination, kind, depth, images, mask, frame_rate, repetitions, ffm
                 pass
 
 
+def _write_preview(destination, images, mask, frame_rate, ffmpeg):
+    stride = max(1, math.ceil(frame_rate / 15))
+    fps = frame_rate / stride
+    stop = max(1, math.floor(8 * fps)) * stride
+    scale = min(1, 480 / max(images.shape[1:3]))
+    size = tuple(max(2, 2 * math.floor(dimension * scale / 2)) for dimension in images.shape[1:3])
+    _encode(destination, "preview", "8", images[:stop:stride], None if mask is None else mask[:stop:stride],
+            fps, 1, ffmpeg, preview_size=size)
+
+
 def _output_directory(prefix, save_output):
     if not isinstance(prefix, str) or not prefix.strip():
         raise ValueError("filename_prefix 不可為空")
@@ -483,8 +589,7 @@ def _output_directory(prefix, save_output):
     if not parent.is_relative_to(root):
         raise ValueError("filename_prefix 不可超出 ComfyUI 輸出目錄")
     parent.mkdir(parents=True, exist_ok=True)
-    directory = Path(tempfile.mkdtemp(prefix=relative.name + "_", dir=parent))
-    return root, directory
+    return Path(tempfile.mkdtemp(prefix=relative.name + "_", dir=parent))
 
 
 class VideoCombineWithMask:
@@ -530,7 +635,7 @@ class VideoCombineWithMask:
         if kind in ("h264", "vp9") and any(size % 2 for size in images.shape[1:3]):
             raise ValueError("H.264／VP9 的 4:2:0 格式需要偶數寬高；不會自動裁切或補邊")
         ffmpeg = find_ffmpeg()
-        root, directory = _output_directory(filename_prefix, save_output)
+        directory = _output_directory(filename_prefix, save_output)
         sequence = kind in ("png", "exr")
         if sequence:
             (directory / "frames").mkdir()
@@ -539,28 +644,29 @@ class VideoCombineWithMask:
             destination = directory / f"video.{extension}"
         _encode(destination, kind, depth, images, mask, frame_rate, repetitions, ffmpeg)
         paths = [str(destination)]
-        if has_mask and (save_mask_sequence or (kind == "h264" and mask_mode == "separate_png")):
+        extra_mask = has_mask and (save_mask_sequence or (kind == "h264" and mask_mode == "separate_png"))
+        if extra_mask:
             (directory / "mask").mkdir()
             mask_destination = directory / "mask" / "%08d.png"
             _encode(mask_destination, "png", "16", images, mask, frame_rate, repetitions, ffmpeg, mask_only=True)
             paths.append(str(mask_destination))
+        frame_count = len(images) * repetitions
         metadata = {"format": format, "bit_depth": depth, "fps": frame_rate,
-                    "frame_count": len(images) * repetitions, "alpha_convention": "mask=alpha",
+                    "frame_count": frame_count, "alpha_convention": "mask=alpha",
                     "mask_sequence": len(paths) > 1, "files": paths}
         manifest = directory / "manifest.json"
         manifest.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
         paths.append(str(manifest))
-        # 預覽專用 8-bit 縮圖不參與母檔編碼；MOV／EXR 的瀏覽器支援不一致。
-        from PIL import Image
-        thumbnail = directory / "preview.png"
-        preview = images[0, ..., :3].detach().to(device="cpu", dtype=torch.float32).numpy()
-        Image.fromarray(np.rint(np.clip(preview, 0, 1) * 255).astype(np.uint8)).save(thumbnail)
-        storage_type = "output" if save_output else "temp"
-        subfolder = directory.relative_to(root).as_posix()
-        ui = {"images": [{"filename": thumbnail.name, "subfolder": subfolder, "type": storage_type}],
-              "mask_video_files": paths}
-        if kind in ("vp9", "h264"):
-            ui["mask_videos"] = [{"filename": destination.name, "subfolder": subfolder, "type": storage_type}]
+        preview = destination
+        if kind != "vp9":
+            preview = directory / "preview.webm"
+            _write_preview(preview, images, mask, frame_rate, ffmpeg)
+        raw = [destination]
+        if sequence:
+            raw = [manifest, *(destination.with_name(destination.name % index) for index in range(frame_count))]
+            if extra_mask:
+                raw.extend(mask_destination.with_name(mask_destination.name % index) for index in range(frame_count))
+        ui = _media_ui(preview, raw, directory if sequence else None)
         return {"ui": ui, "result": (json.dumps(paths, ensure_ascii=False),)}
 
 

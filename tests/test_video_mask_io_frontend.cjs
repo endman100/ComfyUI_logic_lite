@@ -36,9 +36,9 @@ async function fixture(name, status = 200) {
             const element = {tag, style: {}, children: [], removed: false,
                 append(value) { this.children.push(value); },
                 replaceChildren() { this.children = []; },
-                querySelectorAll(tag) { return this.children.filter(child => child.tag === tag); },
-                addEventListener() {}, click() {}, remove() { this.removed = true; },
+                addEventListener() {}, click() { this.clicked = true; }, remove() { this.removed = true; },
                 pause() { this.paused = true; }, removeAttribute(key) { delete this[key]; }, load() {},
+                async play() { this.paused = false; },
             };
             elements.push(element);
             return element;
@@ -50,20 +50,33 @@ async function fixture(name, status = 200) {
     }
     vm.runInNewContext(source, {__app: app, __api: api, document, FormData,
         crypto: {randomUUID: () => "test-group"}, URLSearchParams, console: {error() {}}}, {filename: file});
-    class Node {
-        constructor() { this.widgets = [{name: "video", value: "original.mov"}]; this.dom = []; }
-        onNodeCreated() { return "created"; }
-        onExecuted() { return "executed"; }
-        onRemoved() { return "removed"; }
-        addWidget(type, name, value, callback, options) { this.widgets.push({type, name, value, callback, options}); }
-        addDOMWidget(name, type, container, options) { this.dom.push({name, container, options}); }
-        computeSize() { return [320, 400]; }
-        setSize(value) { this.size = value; }
+    async function makeNode(name) {
+        class Node {
+            constructor() {
+                this.widgets = [{name: "video", value: "original.mov"}];
+                this.dom = [];
+                this.size = [320, 300];
+                this.graph = app.graph;
+            }
+            onNodeCreated() { return "created"; }
+            onExecuted() { return "executed"; }
+            onRemoved() { return "removed"; }
+            getExtraMenuOptions() { return "menu"; }
+            addWidget(type, name, value, callback, options) { this.widgets.push({type, name, value, callback, options}); }
+            addDOMWidget(name, type, container, options) {
+                const widget = {name, container, options};
+                this.dom.push(widget);
+                return widget;
+            }
+            computeSize() { return [320, 400]; }
+            setSize(value) { this.size = value; }
+            setDirtyCanvas() {}
+        }
+        const original = Node.prototype.onNodeCreated;
+        await extension.beforeRegisterNodeDef(Node, {name});
+        return {node: new Node(), Node, original};
     }
-    const original = Node.prototype.onNodeCreated;
-    await extension.beforeRegisterNodeDef(Node, {name});
-    const node = new Node();
-    return {node, Node, original, elements, uploads, errors};
+    return {...await makeNode(name), makeNode, elements, uploads, errors};
 }
 
 test("單檔上傳使用 ComfyUI 端點並保留伺服器子資料夾", async () => {
@@ -105,32 +118,97 @@ test("上傳失敗或多部影片不會改寫已選路徑", async () => {
     }
 });
 
-test("預覽使用 /view 並於更新或移除時釋放影片", async () => {
-    const {node} = await fixture(SAVE_ID);
-    const output = {mask_videos: [{filename: "video.webm", subfolder: "shot one", type: "temp"}],
-        mask_video_files: ["/output/shot/video.webm"]};
-    assert.equal(node.onExecuted(output), "executed");
-    assert.equal(node.dom.length, 1);
-    const container = node.dom[0].container;
-    const video = container.children[0];
-    assert.ok(video.src.startsWith("/prefix/view?"));
-    assert.ok(video.src.includes("subfolder=shot+one"));
-    assert.equal(node.dom[0].options.serialize, false);
-    node.onExecuted(output);
-    assert.equal(video.paused, true);
-    assert.equal(video.src, undefined);
-    assert.equal(node.dom.length, 1);
-    const latest = container.children[0];
-    assert.equal(node.onRemoved(), "removed");
-    assert.equal(latest.paused, true);
+const media = {preview: "/logiclite/video-mask/test/preview", raw: "/logiclite/video-mask/test/raw"};
+const output = {mask_video_previews: [media], mask_video_files: ["D:\\output\\shot\\manifest.json"]};
+
+function menuItems(node) {
+    const options = [{content: "Existing item"}];
+    assert.equal(node.getExtraMenuOptions(null, options), "menu");
+    assert.equal(options.at(-1).content, "Existing item");
+    return options.filter(Boolean).slice(0, -1);
+}
+
+test("both nodes play muted looping video without path text and release old media", async () => {
+    for (const type of [LOAD_ID, SAVE_ID]) {
+        const {node} = await fixture(type);
+        assert.equal(node.onExecuted(output), "executed");
+        assert.equal(node.dom.length, 1);
+        const {container, options} = node.dom[0];
+        assert.equal(options.serialize, false);
+        assert.equal(container.children.length, 1);
+        const video = container.children[0];
+        assert.equal(video.tag, "video");
+        assert.equal(video.src, `/prefix${media.preview}`);
+        assert.ok(video.loop && video.autoplay && video.muted && video.playsInline);
+        assert.equal(video.paused, false);
+        assert.equal(container.textContent, undefined);
+        assert.equal(video.textContent, undefined);
+        assert.equal(node.title, undefined);
+        node.onExecuted(output);
+        assert.equal(video.paused, true);
+        assert.equal(video.src, undefined);
+        assert.equal(node.dom.length, 1);
+        const latest = container.children[0];
+        assert.equal(node.onRemoved(), "removed");
+        assert.equal(latest.paused, true);
+        assert.equal(latest.src, undefined);
+        assert.deepEqual(menuItems(node), []);
+    }
 });
 
-test("不支援瀏覽器播放的格式仍顯示純文字路徑，不注入 HTML", async () => {
-    const {node} = await fixture(SAVE_ID);
+test("legacy raw paths alone create no widget or menu", async () => {
+    const {node} = await fixture(LOAD_ID);
     node.onExecuted({mask_video_files: ["/output/<frame>.exr"]});
-    const paths = node.dom[0].container.children[0];
-    assert.equal(paths.tag, "pre");
-    assert.equal(paths.textContent, "/output/<frame>.exr");
+    assert.equal(node.dom.length, 0);
+    assert.deepEqual(menuItems(node), []);
+});
+
+test("both node menus pause, hide, sync the current graph and download raw", async () => {
+    const {node: load, makeNode, elements} = await fixture(LOAD_ID);
+    const {node: save} = await makeNode(SAVE_ID);
+    const {node: otherGraph} = await makeNode(SAVE_ID);
+    otherGraph.graph = {};
+    for (const node of [load, save, otherGraph]) node.onExecuted(output);
+    const video = node => node.dom[0].container.children[0];
+    const action = (node, label) => menuItems(node).find(item => item.content === label).callback();
+    for (const node of [load, save]) {
+        assert.deepEqual(menuItems(node).map(item => item.content), ["Pause preview", "Hide preview", "Sync preview", "Download raw"]);
+        action(node, "Pause preview");
+        assert.equal(video(node).paused, true);
+        assert.equal(video(node).autoplay, false);
+        action(node, "Hide preview");
+        assert.equal(node.dom[0].hidden, true);
+        action(node, "Show preview");
+        assert.equal(node.dom[0].hidden, false);
+        assert.equal(video(node).paused, true);
+        action(node, "Resume preview");
+        assert.equal(video(node).paused, false);
+        video(load).currentTime = 4;
+        video(save).currentTime = 6;
+        video(otherGraph).currentTime = 7;
+        action(node, "Sync preview");
+        assert.equal(video(load).currentTime, 0);
+        assert.equal(video(save).currentTime, 0);
+        assert.equal(video(otherGraph).currentTime, 7);
+        action(node, "Download raw");
+        const link = elements.at(-1);
+        assert.equal(link.tag, "a");
+        assert.equal(link.href, `/prefix${media.raw}`);
+        assert.equal(link.download, "");
+        assert.ok(link.clicked && link.removed);
+    }
+});
+
+test("each batch result has its own raw download when available", async () => {
+    const {node, elements} = await fixture(SAVE_ID);
+    node.onExecuted({mask_video_previews: [{...media, raw: null}]});
+    assert.ok(!menuItems(node).some(item => item.content === "Download raw"));
+    const second = {...media, raw: "/logiclite/video-mask/second/raw"};
+    node.onExecuted({mask_video_previews: [media, second]});
+    assert.equal(node.dom[0].container.children.length, 2);
+    const {submenu} = menuItems(node).find(item => item.content === "Download raw");
+    submenu.options[1].callback();
+    assert.equal(elements.at(-1).href, `/prefix${second.raw}`);
 });
 
 test("既有影片與遮罩節點不被新擴充掛鉤", async () => {

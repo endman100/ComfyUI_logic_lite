@@ -3,6 +3,7 @@ import { api } from "../../scripts/api.js";
 
 const LOAD_ID = "Load Video With Mask (Upload) (endman100)";
 const SAVE_ID = "Video Combine With Mask (endman100)";
+const previews = new Map();
 
 async function uploadFiles(node, files) {
     if (!files.length) return;
@@ -32,17 +33,74 @@ async function uploadFiles(node, files) {
     }
 }
 
-function releasePreview(node) {
-    node._logicLiteMaskMedia?.querySelectorAll("video").forEach(video => {
+function releaseVideos(state) {
+    for (const video of state.videos) {
         video.pause();
         video.removeAttribute("src");
         video.load();
-    });
+    }
+    state.videos = [];
+    state.container.replaceChildren();
+}
+
+function resizePreview(node) {
+    node.setSize([node.size[0], node.computeSize()[1]]);
+    node.setDirtyCanvas(true, true);
+}
+
+function updatePlayback(state) {
+    for (const video of state.videos) {
+        video.autoplay = !state.paused && !state.hidden;
+        if (!video.autoplay) video.pause();
+        else video.play().catch(() => {});
+    }
+}
+
+function showPreviews(node, media) {
+    let state = previews.get(node);
+    if (!state && !media.length) return;
+    if (!state) {
+        const container = document.createElement("div");
+        container.style.pointerEvents = "none";
+        state = {container, videos: [], raw: [], paused: false, hidden: false};
+        state.widget = node.addDOMWidget("mask_video_preview", "video", container, {
+            serialize: false,
+            getMinHeight: () => state.videos.reduce((sum, video) => {
+                const ratio = video.videoHeight / video.videoWidth || 9 / 16;
+                return sum + Math.min(220, Math.max(1, node.size[0] - 20) * ratio);
+            }, 0),
+        });
+        previews.set(node, state);
+    }
+    releaseVideos(state);
+    state.raw = media.map(item => item.raw);
+    for (const item of media) {
+        const video = document.createElement("video");
+        video.loop = video.muted = video.playsInline = true;
+        Object.assign(video.style, {display: "block", width: "100%", maxHeight: "220px", objectFit: "contain"});
+        video.addEventListener("loadedmetadata", () => resizePreview(node));
+        video.src = api.apiURL(item.preview);
+        state.videos.push(video);
+        state.container.append(video);
+    }
+    state.widget.hidden = state.container.hidden = state.hidden || !state.videos.length;
+    updatePlayback(state);
+    resizePreview(node);
+}
+
+function downloadRaw(url) {
+    const link = document.createElement("a");
+    link.href = api.apiURL(url);
+    link.download = "";
+    document.body.append(link);
+    link.click();
+    link.remove();
 }
 
 app.registerExtension({
     name: "endman100.VideoMaskIO",
     async beforeRegisterNodeDef(nodeType, nodeData) {
+        if (nodeData.name !== LOAD_ID && nodeData.name !== SAVE_ID) return;
         if (nodeData.name === LOAD_ID) {
             const original = nodeType.prototype.onNodeCreated;
             nodeType.prototype.onNodeCreated = function () {
@@ -70,37 +128,55 @@ app.registerExtension({
                 return result;
             };
         }
-        if (nodeData.name !== SAVE_ID) return;
         const executed = nodeType.prototype.onExecuted;
         nodeType.prototype.onExecuted = function (output) {
             const result = executed?.apply(this, arguments);
-            releasePreview(this);
-            if (!this._logicLiteMaskMedia) {
-                this._logicLiteMaskMedia = document.createElement("div");
-                this.addDOMWidget("mask_video_preview", "div", this._logicLiteMaskMedia, {serialize: false});
-            }
-            const container = this._logicLiteMaskMedia;
-            container.replaceChildren();
-            for (const file of output?.mask_videos ?? []) {
-                const video = document.createElement("video");
-                video.controls = true;
-                video.loop = true;
-                video.style.width = "100%";
-                const query = new URLSearchParams({filename: file.filename, subfolder: file.subfolder, type: file.type});
-                video.src = api.apiURL(`/view?${query}`);
-                container.append(video);
-            }
-            const paths = document.createElement("pre");
-            paths.style.whiteSpace = "pre-wrap";
-            paths.style.overflowWrap = "anywhere";
-            paths.textContent = (output?.mask_video_files ?? []).join("\n");
-            container.append(paths);
-            this.setSize?.(this.computeSize());
+            showPreviews(this, output?.mask_video_previews ?? []);
+            return result;
+        };
+        const menu = nodeType.prototype.getExtraMenuOptions;
+        nodeType.prototype.getExtraMenuOptions = function (canvas, options) {
+            const result = menu?.apply(this, arguments);
+            const state = previews.get(this);
+            if (!state?.videos.length) return result;
+            const items = [{
+                content: state.paused ? "Resume preview" : "Pause preview",
+                callback: () => {
+                    state.paused = !state.paused;
+                    updatePlayback(state);
+                },
+            }, {
+                content: state.hidden ? "Show preview" : "Hide preview",
+                callback: () => {
+                    state.hidden = !state.hidden;
+                    state.widget.hidden = state.container.hidden = state.hidden;
+                    updatePlayback(state);
+                    resizePreview(this);
+                },
+            }, {
+                content: "Sync preview",
+                callback: () => {
+                    for (const [node, peer] of previews) {
+                        if (node.graph !== this.graph) continue;
+                        for (const video of peer.videos) video.currentTime = 0;
+                    }
+                },
+            }];
+            const downloads = state.raw.flatMap((url, index) => url ? [{
+                content: `Result ${index + 1}`, callback: () => downloadRaw(url),
+            }] : []);
+            if (downloads.length === 1) items.push({...downloads[0], content: "Download raw"});
+            if (downloads.length > 1) items.push({content: "Download raw", has_submenu: true, submenu: {options: downloads}});
+            options.unshift(...items, null);
             return result;
         };
         const removed = nodeType.prototype.onRemoved;
         nodeType.prototype.onRemoved = function () {
-            releasePreview(this);
+            const state = previews.get(this);
+            if (state) {
+                releaseVideos(state);
+                previews.delete(this);
+            }
             return removed?.apply(this, arguments);
         };
     },
