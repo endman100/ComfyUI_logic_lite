@@ -5,7 +5,7 @@ const LOAD_ID = "Load Video With Mask (Upload) (endman100)";
 const SAVE_ID = "Video Combine With Mask (endman100)";
 const PREVIEW_STATE = Symbol("logicLiteVideoMaskPreview");
 const LOAD_PREVIEW = Symbol("logicLiteLoadPreviewRequest");
-const UPLOAD_PROGRESS = Symbol("logicLiteUploadProgress");
+const UPLOADING = Symbol("logicLiteUploading");
 const LOAD_SETTINGS = ["video", "source_path", "frame_load_cap", "skip_first_frames", "select_every_nth",
     "force_rate", "custom_width", "custom_height", "sequence_fps", "missing_alpha"];
 const SEQUENCE_FILE = /\.(png|exr)$/i;
@@ -84,7 +84,7 @@ function uploadFile(form, onProgress) {
     });
 }
 
-async function uploadFiles(node, files, progress) {
+async function uploadFiles(node, files, reportProgress) {
     const sequence = files.length > 1;
     if (sequence && !isImageSequence(files)) {
         throw new Error("多檔上傳只接受同一格式的 PNG 或 EXR 序列；影片請一次選取一個檔案。");
@@ -101,9 +101,9 @@ async function uploadFiles(node, files, progress) {
         form.append("subfolder", subfolder);
         form.append("overwrite", "false");
         const size = file.size || 1;
-        const saved = await uploadFile(form, fraction => { progress.value = (sent + size * fraction) / total; });
+        const saved = await uploadFile(form, fraction => reportProgress((sent + size * fraction) / total));
         sent += size;
-        progress.value = sent / total;
+        reportProgress(sent / total);
         selected = sequence ? saved.subfolder : [saved.subfolder, saved.name].filter(Boolean).join("/");
     }
     const widget = node.widgets?.find(widget => widget.name === "video");
@@ -120,33 +120,20 @@ async function uploadFiles(node, files, progress) {
 }
 
 async function uploadWithFeedback(node, files) {
-    if (!files.length) return;
-    let upload = node[UPLOAD_PROGRESS];
-    if (!upload) {
-        const container = document.createElement("div");
-        const progress = document.createElement("progress");
-        progress.setAttribute("aria-label", "上傳進度");
-        progress.title = "上傳進度";
-        progress.max = 1;
-        progress.style.width = "100%";
-        container.style.pointerEvents = "none";
-        container.append(progress);
-        const widget = node.addDOMWidget("mask_video_upload_progress", "progress", container, {
-            serialize: false, getMinHeight: () => 26, getMaxHeight: () => 26,
-        });
-        upload = node[UPLOAD_PROGRESS] = {container, progress, widget};
-    } else if (!upload.widget.hidden) return;
-    upload.widget.hidden = upload.container.hidden = false;
-    upload.progress.value = 0;
-    resizeNode(node);
+    if (!files.length || node[UPLOADING]) return;
+    node[UPLOADING] = true;
+    const reportProgress = value => {
+        node.progress = value;
+        node.setDirtyCanvas(true, false);
+    };
     try {
-        await uploadFiles(node, files, upload.progress);
+        await uploadFiles(node, files, reportProgress);
     } catch (error) {
         app.extensionManager?.toast?.add({severity: "error", summary: "遮罩影片上傳失敗", detail: error.message});
         console.error("遮罩影片上傳失敗", error);
     } finally {
-        upload.widget.hidden = upload.container.hidden = true;
-        if (node.graph) resizeNode(node);
+        delete node[UPLOADING];
+        reportProgress(undefined);
     }
 }
 

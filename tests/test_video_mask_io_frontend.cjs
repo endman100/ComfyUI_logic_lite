@@ -191,7 +191,7 @@ test("拖放影片或同格式序列會上傳、選中並重新預覽", async ()
     }
 });
 
-test("上傳按鈕和拖放共用進度條，序列按檔案大小累計並在結束時隱藏", async () => {
+test("上傳按鈕和拖放共用節點原生進度，序列按檔案大小累計並在結束時清除", async () => {
     for (const drag of [false, true]) {
         const {node, elements, uploads} = await fixture(LOAD_ID, 200, true);
         node.onNodeCreated();
@@ -204,20 +204,18 @@ test("上傳按鈕和拖放共用進度條，序列按檔案大小累計並在�
             input.files = files;
             void input.onchange();
         }
-        const widget = node.dom.find(widget => widget.name === "mask_video_upload_progress");
-        const progress = widget.container.children[0];
-        assert.equal(widget.hidden, false);
-        assert.equal(progress.tag, "progress");
+        assert.equal(node.dom.length, 0);
+        assert.ok(!elements.some(element => element.tag === "progress"));
         uploads[0].xhr.upload.onprogress({lengthComputable: true, loaded: 50, total: 100});
-        assert.equal(progress.value, 0.125);
+        assert.equal(node.progress, 0.125);
         uploads[0].xhr.onload();
         await new Promise(setImmediate);
         uploads[1].xhr.upload.onprogress({lengthComputable: true, loaded: 150, total: 300});
-        assert.equal(progress.value, 0.625);
+        assert.equal(node.progress, 0.625);
         uploads[1].xhr.onload();
         await new Promise(setImmediate);
-        assert.equal(progress.value, 1);
-        assert.equal(widget.hidden, true);
+        assert.equal(node.progress, undefined);
+        assert.equal(node.dom.length, 0);
     }
 });
 
@@ -242,11 +240,18 @@ test("拖放工作流、連結或混合序列仍交由原本的拖放處理", as
 test("上傳失敗或多部影片不會改寫已選路徑", async () => {
     for (const [status, files] of [[500, [{name: "a.mov"}]], [200, [{name: "a.mov"}, {name: "b.mov"}]],
         [200, [{name: "a.png"}, {name: "b.exr"}]]]) {
-        const {node, elements, errors} = await fixture(LOAD_ID, status);
+        const {node, elements, errors, uploads} = await fixture(LOAD_ID, status, true);
         node.onNodeCreated(); node.widgets.at(-1).callback();
         const input = elements.at(-1);
         input.files = files;
-        await input.onchange();
+        const upload = input.onchange();
+        if (status === 500) {
+            uploads[0].xhr.upload.onprogress({lengthComputable: true, loaded: 1, total: 2});
+            assert.equal(node.progress, 0.5);
+            uploads[0].xhr.onload();
+        }
+        await upload;
+        assert.equal(node.progress, undefined);
         assert.equal(node.widgets[0].value, "original.mov");
         assert.equal(errors.length, 1);
         assert.equal(input.removed, true);
