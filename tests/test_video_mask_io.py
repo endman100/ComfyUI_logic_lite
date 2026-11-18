@@ -385,10 +385,28 @@ class VideoMaskIOTests(unittest.TestCase):
         self.assertLess(rgb.min().item(), 0)
         self.assertGreater(rgb.max().item(), 1)
 
-    def test_shape_length_validation_never_broadcasts(self):
+    def test_single_mask_is_written_as_alpha_for_every_frame(self):
+        import numpy as np
+        images, alpha = synthetic()
+        static = alpha[0]
+        for mask in (static, static.unsqueeze(0), static[None, ..., None]):
+            with self.subTest(shape=tuple(mask.shape)):
+                with (patch.object(io, "_BUFFER_BYTES", 2 * 24 * 32 * 4 * 4),
+                      patch.object(io.subprocess, "Popen") as popen):
+                    process = popen.return_value
+                    process.wait.return_value = process.poll.return_value = 0
+                    self.save(images, mask, format=PRORES)
+                writes = process.stdin.write.call_args_list
+                self.assertEqual(len(writes), 2)
+                raw = b"".join(call.args[0] for call in writes)
+                rgba = np.frombuffer(raw, dtype="<u2").reshape(3, 24, 32, 4)
+                expected = np.rint(static.numpy() * 65535).astype("<u2")
+                np.testing.assert_array_equal(rgba[..., 3], np.broadcast_to(expected, (3, 24, 32)))
+
+    def test_shape_validation_rejects_spatial_and_non_singleton_frame_mismatches(self):
         images, _ = synthetic()
-        for shape in ((2, 24, 32), (3, 23, 32), (3, 24, 31), (24, 32)):
-            with self.assertRaisesRegex(ValueError, "相同 T,H,W"):
+        for shape in ((0, 24, 32), (2, 24, 32), (3, 23, 32), (1, 24, 31), (1, 1, 32)):
+            with self.subTest(shape=shape), self.assertRaisesRegex(ValueError, "mask.*images="):
                 self.save(images, torch.ones(shape))
         with self.assertRaisesRegex(ValueError, "images"):
             self.save(torch.empty(0, 24, 32, 3))

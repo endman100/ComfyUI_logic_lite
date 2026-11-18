@@ -396,8 +396,12 @@ def _validate_images(images, mask):
             mask = mask.unsqueeze(0)
         elif mask.ndim == 4 and mask.shape[-1] == 1:
             mask = mask.squeeze(-1)
-        if mask.shape != images.shape[:3]:
-            raise ValueError(f"images 與 mask 必須具有相同 T,H,W；images={tuple(images.shape[:3])}，mask={tuple(mask.shape)}")
+        if mask.shape == images.shape[:3]:
+            return mask
+        if mask.ndim == 3 and mask.shape[0] == 1 and mask.shape[1:] == images.shape[1:3]:
+            return mask.expand(images.shape[:3])
+        raise ValueError("mask 必須與 images 有相同 H,W，且格數為 1 或與 images 相同；"
+                         f"images={tuple(images.shape[:3])}，mask={tuple(mask.shape)}")
     return mask
 
 
