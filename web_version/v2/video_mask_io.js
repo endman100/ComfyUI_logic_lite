@@ -3,7 +3,6 @@ import { api } from "../../scripts/api.js";
 
 const LOAD_ID = "Load Video With Mask (Upload) (endman100)";
 const SAVE_ID = "Video Combine With Mask (endman100)";
-const SEEK_BAR_HEIGHT = 14;
 const PREVIEW_STATE = Symbol("logicLiteVideoMaskPreview");
 const previews = new Set();
 
@@ -60,30 +59,6 @@ function updateMaskModeVisibility(node) {
     }
 }
 
-function createSeekBar(video) {
-    const bar = document.createElement("input");
-    Object.assign(bar, {type: "range", min: "0", max: "1", step: "any", value: "0", disabled: true});
-    bar.setAttribute("aria-label", "Seek preview");
-    Object.assign(bar.style, {display: "block", width: "100%", height: `${SEEK_BAR_HEIGHT}px`, margin: "0",
-        accentColor: "#72b7e9", pointerEvents: "auto"});
-
-    function updateProgress() {
-        const duration = video.duration;
-        bar.disabled = !Number.isFinite(duration) || duration <= 0;
-        bar.value = bar.disabled ? "0" : String(video.currentTime / duration);
-    }
-
-    for (const event of ["durationchange", "timeupdate", "seeked"]) {
-        video.addEventListener(event, updateProgress);
-    }
-    bar.addEventListener("input", () => {
-        if (!bar.disabled) video.currentTime = bar.valueAsNumber * video.duration;
-    });
-    bar.addEventListener("pointerdown", event => event.stopPropagation());
-    bar.addEventListener("keydown", event => event.stopPropagation());
-    return bar;
-}
-
 function updatePlayback(state) {
     for (const video of state.videos) {
         video.autoplay = !state.paused && !state.hidden;
@@ -103,7 +78,7 @@ function showPreviews(node, media) {
             serialize: false,
             getMinHeight: () => state.videos.reduce((sum, video) => {
                 const ratio = video.videoHeight / video.videoWidth || 9 / 16;
-                return sum + Math.min(220, Math.max(1, node.size[0] - 20) * ratio) + SEEK_BAR_HEIGHT;
+                return sum + Math.min(220, Math.max(1, node.size[0] - 20) * ratio);
             }, 0),
         });
         node[PREVIEW_STATE] = state;
@@ -116,10 +91,9 @@ function showPreviews(node, media) {
         video.loop = video.muted = video.playsInline = true;
         Object.assign(video.style, {display: "block", width: "100%", maxHeight: "220px", objectFit: "contain"});
         video.addEventListener("loadedmetadata", () => resizeNode(node));
-        const seekBar = createSeekBar(video);
         video.src = api.apiURL(item.preview);
         state.videos.push(video);
-        state.container.append(video, seekBar);
+        state.container.append(video);
     }
     state.widget.hidden = state.container.hidden = state.hidden || !state.videos.length;
     updatePlayback(state);

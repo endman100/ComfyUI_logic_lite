@@ -43,14 +43,10 @@ async function fixture(name, status = 200) {
     const document = {
         body: {append() {}},
         createElement(tag) {
-            const listeners = new Map();
-            const element = {tag, style: {}, children: [], attributes: {}, removed: false,
-                append(...values) { this.children.push(...values); },
+            const element = {tag, style: {}, children: [], removed: false,
+                append(value) { this.children.push(value); },
                 replaceChildren() { this.children = []; },
-                addEventListener(type, callback) { listeners.set(type, callback); },
-                emit(type) { listeners.get(type)?.(); },
-                setAttribute(key, value) { this.attributes[key] = value; },
-                get valueAsNumber() { return Number(this.value); },
+                addEventListener() {},
                 click() { this.clicked = true; }, remove() { this.removed = true; },
                 pause() { this.paused = true; }, removeAttribute(key) { delete this[key]; }, load() {},
                 async play() { this.paused = false; },
@@ -199,7 +195,7 @@ test("both nodes play muted looping video without path text and release old medi
         assert.equal(node.dom.length, 1);
         const {container, options} = node.dom[0];
         assert.equal(options.serialize, false);
-        assert.equal(container.children.length, 2);
+        assert.equal(container.children.length, 1);
         const video = container.children[0];
         assert.equal(video.tag, "video");
         assert.equal(video.src, `/prefix${media.preview}`);
@@ -217,44 +213,6 @@ test("both nodes play muted looping video without path text and release old medi
         assert.equal(latest.paused, true);
         assert.equal(latest.src, undefined);
         assert.deepEqual(menuItems(node), []);
-    }
-});
-
-test("both nodes track playback and seek from their preview bar", async () => {
-    for (const type of [LOAD_ID, SAVE_ID]) {
-        const {node} = await fixture(type);
-        node.onExecuted(output);
-        const [video, bar] = node.dom[0].container.children;
-        assert.equal(bar.tag, "input");
-        assert.equal(bar.type, "range");
-        assert.equal(bar.attributes["aria-label"], "Seek preview");
-        assert.equal(bar.disabled, true);
-        assert.equal(bar.value, "0");
-
-        video.duration = 8;
-        video.currentTime = 2;
-        video.emit("durationchange");
-        assert.equal(bar.disabled, false);
-        assert.equal(bar.valueAsNumber, 0.25);
-
-        bar.value = "0.75";
-        bar.emit("input");
-        assert.equal(video.currentTime, 6);
-        assert.equal(video.paused, false);
-
-        video.currentTime = 0;
-        video.emit("seeked");
-        assert.equal(bar.valueAsNumber, 0);
-        video.currentTime = 1;
-        video.emit("timeupdate");
-        assert.equal(bar.valueAsNumber, 0.125);
-
-        video.duration = Infinity;
-        video.emit("durationchange");
-        assert.equal(bar.disabled, true);
-        bar.value = "0.5";
-        bar.emit("input");
-        assert.equal(video.currentTime, 1);
     }
 });
 
@@ -348,7 +306,7 @@ test("each batch result has its own raw download when available", async () => {
     assert.ok(!menuItems(node).some(item => item.content === "Download raw"));
     const second = {...media, raw: "/logiclite/video-mask/second/raw"};
     node.onExecuted({mask_video_previews: [media, second]});
-    assert.deepEqual(node.dom[0].container.children.map(element => element.tag), ["video", "input", "video", "input"]);
+    assert.deepEqual(node.dom[0].container.children.map(element => element.tag), ["video", "video"]);
     const {submenu} = menuItems(node).find(item => item.content === "Download raw");
     submenu.options[1].callback();
     assert.equal(elements.at(-1).href, `/prefix${second.raw}`);
