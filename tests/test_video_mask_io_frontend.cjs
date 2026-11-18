@@ -10,6 +10,8 @@ const source = fs.readFileSync(file, "utf8")
     .replace('import { api } from "../../scripts/api.js";', "const api = globalThis.__api;");
 const LOAD_ID = "Load Video With Mask (Upload) (endman100)";
 const SAVE_ID = "Video Combine With Mask (endman100)";
+const PRORES = "[mask] ProRes 4444 (.mov)";
+const H264 = "[no mask] H.264 (.mp4)";
 
 async function fixture(name, status = 200) {
     let extension;
@@ -33,10 +35,15 @@ async function fixture(name, status = 200) {
     const document = {
         body: {append() {}},
         createElement(tag) {
-            const element = {tag, style: {}, children: [], removed: false,
-                append(value) { this.children.push(value); },
+            const listeners = new Map();
+            const element = {tag, style: {}, children: [], attributes: {}, removed: false,
+                append(...values) { this.children.push(...values); },
                 replaceChildren() { this.children = []; },
-                addEventListener() {}, click() { this.clicked = true; }, remove() { this.removed = true; },
+                addEventListener(type, callback) { listeners.set(type, callback); },
+                emit(type) { listeners.get(type)?.(); },
+                setAttribute(key, value) { this.attributes[key] = value; },
+                get valueAsNumber() { return Number(this.value); },
+                click() { this.clicked = true; }, remove() { this.removed = true; },
                 pause() { this.paused = true; }, removeAttribute(key) { delete this[key]; }, load() {},
                 async play() { this.paused = false; },
             };
@@ -51,14 +58,25 @@ async function fixture(name, status = 200) {
     vm.runInNewContext(source, {__app: app, __api: api, document, FormData,
         crypto: {randomUUID: () => "test-group"}, URLSearchParams, console: {error() {}}}, {filename: file});
     async function makeNode(name) {
+        const combineWidgets = () => [
+            {name: "format", value: PRORES},
+            {name: "mask_mode", type: "combo", value: "error", options: {serialize: true}},
+        ];
         class Node {
             constructor() {
-                this.widgets = [{name: "video", value: "original.mov"}];
+                this.widgets = name === SAVE_ID ? combineWidgets() : [{name: "video", value: "original.mov"}];
                 this.dom = [];
                 this.size = [320, 300];
                 this.graph = app.graph;
             }
             onNodeCreated() { return "created"; }
+            onConfigure({format, maskMode, recreateWidgets}) {
+                if (recreateWidgets) this.widgets = combineWidgets();
+                this.widgets[0].value = format;
+                this.widgets[1].value = maskMode;
+                return "configured";
+            }
+            onWidgetChanged() { return "changed"; }
             onExecuted() { return "executed"; }
             onRemoved() { return "removed"; }
             getExtraMenuOptions() { return "menu"; }
@@ -135,7 +153,7 @@ test("both nodes play muted looping video without path text and release old medi
         assert.equal(node.dom.length, 1);
         const {container, options} = node.dom[0];
         assert.equal(options.serialize, false);
-        assert.equal(container.children.length, 1);
+        assert.equal(container.children.length, 2);
         const video = container.children[0];
         assert.equal(video.tag, "video");
         assert.equal(video.src, `/prefix${media.preview}`);
@@ -154,6 +172,83 @@ test("both nodes play muted looping video without path text and release old medi
         assert.equal(latest.src, undefined);
         assert.deepEqual(menuItems(node), []);
     }
+});
+
+test("both nodes track playback and seek from their preview bar", async () => {
+    for (const type of [LOAD_ID, SAVE_ID]) {
+        const {node} = await fixture(type);
+        node.onExecuted(output);
+        const [video, bar] = node.dom[0].container.children;
+        assert.equal(bar.tag, "input");
+        assert.equal(bar.type, "range");
+        assert.equal(bar.attributes["aria-label"], "Seek preview");
+        assert.equal(bar.disabled, true);
+        assert.equal(bar.value, "0");
+
+        video.duration = 8;
+        video.currentTime = 2;
+        video.emit("durationchange");
+        assert.equal(bar.disabled, false);
+        assert.equal(bar.valueAsNumber, 0.25);
+
+        bar.value = "0.75";
+        bar.emit("input");
+        assert.equal(video.currentTime, 6);
+        assert.equal(video.paused, false);
+
+        video.currentTime = 0;
+        video.emit("seeked");
+        assert.equal(bar.valueAsNumber, 0);
+        video.currentTime = 1;
+        video.emit("timeupdate");
+        assert.equal(bar.valueAsNumber, 0.125);
+
+        video.duration = Infinity;
+        video.emit("durationchange");
+        assert.equal(bar.disabled, true);
+        bar.value = "0.5";
+        bar.emit("input");
+        assert.equal(video.currentTime, 1);
+    }
+});
+
+test("Combine shows mask_mode only for no-mask formats and keeps its value and type", async () => {
+    const {node} = await fixture(SAVE_ID);
+    const [format, maskMode] = node.widgets;
+    assert.equal(node.onNodeCreated(), "created");
+    assert.equal(maskMode.hidden, true);
+    maskMode.value = "separate_png";
+
+    for (const alphaFormat of [PRORES, "[mask] ProRes 4444 XQ (.mov)", "[mask] VP9 alpha (.webm)",
+        "[mask] PNG16 RGBA sequence", "[mask] EXR float sequence"]) {
+        let previous = format.value;
+        format.value = H264;
+        assert.equal(node.onWidgetChanged("format", H264, previous, format), "changed");
+        assert.equal(maskMode.hidden, false);
+        previous = format.value;
+        format.value = alphaFormat;
+        node.onWidgetChanged("format", alphaFormat, previous, format);
+        assert.equal(maskMode.hidden, true);
+    }
+    assert.equal(maskMode.value, "separate_png");
+    assert.equal(maskMode.type, "combo");
+    assert.equal(maskMode.options.serialize, true);
+});
+
+test("Combine reapplies mask_mode visibility after restoring values and recreating widgets", async () => {
+    const {node} = await fixture(SAVE_ID);
+    node.onNodeCreated();
+    assert.equal(node.onConfigure({format: H264, maskMode: "ignore"}), "configured");
+    assert.equal(node.widgets[1].hidden, false);
+    assert.equal(node.widgets[1].value, "ignore");
+    const oldMaskMode = node.widgets[1];
+    node.onConfigure({format: PRORES, maskMode: "ignore", recreateWidgets: true});
+    assert.notEqual(node.widgets[1], oldMaskMode);
+    assert.equal(node.widgets[1].hidden, true);
+    assert.equal(node.widgets[1].value, "ignore");
+    node.onConfigure({format: H264, maskMode: "ignore"});
+    assert.equal(node.widgets[1].hidden, false);
+    assert.equal(node.widgets[1].value, "ignore");
 });
 
 test("legacy raw paths alone create no widget or menu", async () => {
@@ -178,8 +273,10 @@ test("both node menus pause, hide, sync the current graph and download raw", asy
         assert.equal(video(node).autoplay, false);
         action(node, "Hide preview");
         assert.equal(node.dom[0].hidden, true);
+        assert.equal(node.dom[0].container.hidden, true);
         action(node, "Show preview");
         assert.equal(node.dom[0].hidden, false);
+        assert.equal(node.dom[0].container.hidden, false);
         assert.equal(video(node).paused, true);
         action(node, "Resume preview");
         assert.equal(video(node).paused, false);
@@ -205,7 +302,7 @@ test("each batch result has its own raw download when available", async () => {
     assert.ok(!menuItems(node).some(item => item.content === "Download raw"));
     const second = {...media, raw: "/logiclite/video-mask/second/raw"};
     node.onExecuted({mask_video_previews: [media, second]});
-    assert.equal(node.dom[0].container.children.length, 2);
+    assert.deepEqual(node.dom[0].container.children.map(element => element.tag), ["video", "input", "video", "input"]);
     const {submenu} = menuItems(node).find(item => item.content === "Download raw");
     submenu.options[1].callback();
     assert.equal(elements.at(-1).href, `/prefix${second.raw}`);
