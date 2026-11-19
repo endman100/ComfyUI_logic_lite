@@ -152,14 +152,17 @@ function resizeNode(node) {
     node.setDirtyCanvas(true, true);
 }
 
-function updateMaskModeVisibility(node) {
+function updateFormatVisibility(node) {
     const format = node.widgets?.find(widget => widget.name === "format")?.value;
-    const maskMode = node.widgets?.find(widget => widget.name === "mask_mode");
-    const hidden = typeof format !== "string" || !format.startsWith("[no mask]");
-    if (maskMode && Boolean(maskMode.hidden) !== hidden) {
-        maskMode.hidden = hidden;
-        resizeNode(node);
+    const visibility = {mask_mode: typeof format === "string" && format.startsWith("[no mask]"),
+        crf: format === "[no mask] H.264 (.mp4)"};
+    let resized = false;
+    for (const widget of node.widgets ?? []) {
+        if (!Object.hasOwn(visibility, widget.name) || Boolean(widget.hidden) === !visibility[widget.name]) continue;
+        widget.hidden = !visibility[widget.name];
+        resized = true;
     }
+    if (resized) resizeNode(node);
 }
 
 function updatePlayback(state) {
@@ -172,13 +175,13 @@ function updatePlayback(state) {
     }
 }
 
-function showPreviews(node, media, isLoader = true) {
+function showPreviews(node, media) {
     let state = node[PREVIEW_STATE];
     if (!state && !media.length) return;
     if (!state) {
         const container = document.createElement("div");
         container.style.pointerEvents = "none";
-        state = {node, container, isLoader, videos: [], raw: [], paused: false, hidden: false, muted: false};
+        state = {node, container, videos: [], raw: [], paused: false, hidden: false, muted: false};
         const previewHeight = () => {
             const padding = (state.widget?.margin ?? 10) * 2;
             const width = Math.max(1, node.size[0] - padding);
@@ -187,7 +190,7 @@ function showPreviews(node, media, isLoader = true) {
         };
         let lastWidth = node.size[0];
         state.widget = node.addDOMWidget("mask_video_preview", "video", container, {
-            serialize: false, getMinHeight: previewHeight, getMaxHeight: previewHeight,
+            serialize: false, hideOnZoom: false, getMinHeight: previewHeight, getMaxHeight: previewHeight,
             afterResize: () => {
                 if (lastWidth === node.size[0]) return;
                 lastWidth = node.size[0];
@@ -199,13 +202,13 @@ function showPreviews(node, media, isLoader = true) {
     }
     releaseVideos(state);
     state.raw = media.map(item => item.raw);
-    state.source = media[0]?.source;
+    state.sources = media.map(item => item.source);
     for (const item of media) {
         const video = document.createElement("video");
         video.loop = video.muted = video.playsInline = true;
         Object.assign(video.style, {display: "block", width: "100%", height: "auto"});
-        if (state.isLoader) {
-            video.style.pointerEvents = "auto";
+        video.style.pointerEvents = "auto";
+        if (item.source?.has_audio) {
             const playHoverAudio = () => {
                 if (state.muted || state.paused || state.hidden) return;
                 video.muted = false;
@@ -218,17 +221,17 @@ function showPreviews(node, media, isLoader = true) {
             video.addEventListener("pointerenter", playHoverAudio);
             video.addEventListener("pointerleave", () => { video.muted = true; });
             video.addEventListener("click", playHoverAudio);
-            video.addEventListener("contextmenu", event => {
-                event.preventDefault();
-                app.canvas.adjustMouseEvent(event);
-                app.canvas.processContextMenu(node, event);
+        }
+        video.addEventListener("contextmenu", event => {
+            event.preventDefault();
+            app.canvas.adjustMouseEvent(event);
+            app.canvas.processContextMenu(node, event);
+        });
+        video.addEventListener("wheel", event => app.canvas.processMouseWheel(event), {passive: false});
+        for (const type of ["dragover", "drop"]) {
+            video.addEventListener(type, event => {
+                if (!app.canvas.canvas.dispatchEvent(new DragEvent(type, event))) event.preventDefault();
             });
-            video.addEventListener("wheel", event => app.canvas.processMouseWheel(event), {passive: false});
-            for (const type of ["dragover", "drop"]) {
-                video.addEventListener(type, event => {
-                    if (!app.canvas.canvas.dispatchEvent(new DragEvent(type, event))) event.preventDefault();
-                });
-            }
         }
         video.addEventListener("loadedmetadata", () => resizeNode(node));
         video.src = api.apiURL(item.preview);
@@ -287,20 +290,21 @@ app.registerExtension({
             }] : []);
             if (downloads.length === 1) items.push({...downloads[0], content: "Download raw"});
             if (downloads.length > 1) items.push({content: "Download raw", has_submenu: true, submenu: {options: downloads}});
-            if (state.isLoader) {
-                const video = state.videos[0];
-                items.push({content: "Open preview", callback: () => window.open(video.src, "_blank", "noopener")},
-                    {content: "Save preview", callback: () => downloadFile(video.src, "preview.webm")});
-                const source = state.source;
-                if (source?.has_audio) items.push({
-                    content: state.muted ? "Unmute preview" : "Mute preview",
-                    callback: () => { state.muted = !state.muted; if (state.muted) video.muted = true; },
-                });
-                if (source) items.push({disabled: true,
-                    content: `${source.width}×${source.height} @ ${Number(source.fps.toFixed(2))} fps` +
-                        (source.frames ? ` · ${source.frames} frames` : ""),
-                });
-            }
+            const video = state.videos[0];
+            items.push({content: "Open preview", callback: () => window.open(video.src, "_blank", "noopener")},
+                {content: "Save preview", callback: () => downloadFile(video.src, "preview.webm")});
+            if (state.sources.some(source => source?.has_audio)) items.push({
+                content: state.muted ? "Unmute preview" : "Mute preview",
+                callback: () => {
+                    state.muted = !state.muted;
+                    if (state.muted) for (const item of state.videos) item.muted = true;
+                },
+            });
+            const source = state.sources[0];
+            if (source) items.push({disabled: true,
+                content: `${source.width}×${source.height} @ ${Number(source.fps.toFixed(2))} fps` +
+                    (source.frames ? ` · ${source.frames} frames` : ""),
+            });
             return [...items, null, ...options];
         };
     },
@@ -364,26 +368,26 @@ app.registerExtension({
             const created = nodeType.prototype.onNodeCreated;
             nodeType.prototype.onNodeCreated = function () {
                 const result = created?.apply(this, arguments);
-                updateMaskModeVisibility(this);
+                updateFormatVisibility(this);
                 return result;
             };
             const configured = nodeType.prototype.onConfigure;
             nodeType.prototype.onConfigure = function () {
                 const result = configured?.apply(this, arguments);
-                updateMaskModeVisibility(this);
+                updateFormatVisibility(this);
                 return result;
             };
             const changed = nodeType.prototype.onWidgetChanged;
             nodeType.prototype.onWidgetChanged = function (name) {
                 const result = changed?.apply(this, arguments);
-                if (name === "format") updateMaskModeVisibility(this);
+                if (name === "format") updateFormatVisibility(this);
                 return result;
             };
         }
         const executed = nodeType.prototype.onExecuted;
         nodeType.prototype.onExecuted = function (output) {
             const result = executed?.apply(this, arguments);
-            showPreviews(this, output?.mask_video_previews ?? [], nodeData.name === LOAD_ID);
+            showPreviews(this, output?.mask_video_previews ?? []);
             return result;
         };
         const removed = nodeType.prototype.onRemoved;

@@ -1,9 +1,11 @@
 """以真實 CPU ffmpeg／OpenCV 檢查影片、alpha 與高精度序列，不啟動 ComfyUI。"""
 
 import asyncio
+from collections import UserDict
 import importlib.util
 from io import BytesIO
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -504,6 +506,61 @@ class VideoMaskIOTests(unittest.TestCase):
         self.assertTrue(Path(paths[0]).is_relative_to(self.root / "temp"))
         self.assertEqual(json.loads(Path(paths[-1]).read_text())["frame_count"], 6)
 
+    def test_pingpong_preserves_image_and_mask_order_ignores_sequence_audio(self):
+        self.require_codec("png")
+        self.require_codec("libvpx-vp9")
+        images, alpha = synthetic(frames=4)
+        order = [0, 1, 2, 3, 2, 1] * 2
+        audio = {"waveform": torch.zeros(1, 1, 4800), "sample_rate": 48000}
+        paths, ui = self.save(images, alpha, pingpong=True, loop_count=1, frame_rate=12,
+                              audio=audio, save_mask_sequence=True)
+        rgb, masks, count, _, _ = self.load(paths[0])
+        self.assertEqual(count, len(order))
+        torch.testing.assert_close(rgb, images[order], atol=0.5 / 65535 + 1e-7, rtol=0)
+        torch.testing.assert_close(masks, alpha[order], atol=0.5 / 65535 + 1e-7, rtol=0)
+        _, separate_masks, *_ = self.load(paths[1])
+        torch.testing.assert_close(separate_masks, masks)
+        item, preview = self.media(ui)
+        self.assertFalse(item["source"]["has_audio"])
+        self.assertIsNone(io._probe(preview, self.ffmpeg)["audio"])
+
+    def test_combine_muxes_audio_with_correct_codecs_timing_and_preview(self):
+        images, alpha = synthetic(frames=4)
+        for format, encoder, codec, duration in ((H264, "libx264", "aac", 0.2),
+                                                 (PRORES, "prores_ks", "pcm_s16le", 1.25),
+                                                 (VP9, "libvpx-vp9", "opus", 1.25)):
+            with self.subTest(format=format):
+                for required in (encoder, "libvpx-vp9", "libopus", "aac" if format == H264 else encoder):
+                    self.require_codec(required)
+                sample_rate = 48000
+                tone = torch.sin(torch.arange(round(duration * sample_rate)) * (2 * math.pi * 440 / sample_rate)) / 2
+                audio = UserDict(waveform=torch.stack((tone, -tone)).unsqueeze(0), sample_rate=sample_rate)
+                paths, ui = self.save(images, alpha, format=format, frame_rate=12, pingpong=True, loop_count=1,
+                                      audio=audio, mask_mode="ignore", crf=24)
+                info = io._probe(paths[0], self.ffmpeg)
+                self.assertEqual(io._video_load_estimate(info, 0, 0, 1, 0), 12)
+                self.assertAlmostEqual(info["duration_seconds"], 1.0, delta=0.03)
+                self.assertEqual(info["audio"]["codec_name"], codec)
+                muxed = io._load_audio(Path(paths[0]), info["audio"], 0, 2, self.ffmpeg)["waveform"]
+                self.assertEqual(muxed.shape[:2], (1, 2))
+                self.assertAlmostEqual(muxed.shape[-1] / sample_rate, 1.0, delta=0.03)
+                self.assertGreater(muxed[..., :4000].abs().mean().item(), 0.1)
+                if duration < 1:
+                    self.assertLess(muxed[..., 24000:].abs().max().item(), 0.001)
+                item, preview = self.media(ui)
+                self.assertTrue(item["source"]["has_audio"])
+                preview_info = io._probe(preview, self.ffmpeg)
+                self.assertTrue(preview_info["has_alpha"])
+                self.assertEqual(preview_info["audio"]["codec_name"], "opus")
+                self.assertAlmostEqual(preview_info["duration_seconds"], 1.0 if format == VP9 else 0.5, delta=0.03)
+
+    def test_combine_validates_audio_and_h264_quality(self):
+        images, _ = synthetic()
+        with self.assertRaisesRegex(ValueError, "waveform"):
+            self.save(images, format=PRORES, audio={"waveform": torch.zeros(2, 1, 4), "sample_rate": 48000})
+        with self.assertRaisesRegex(ValueError, "crf"):
+            self.save(images, format=H264, crf=52)
+
     def test_output_prefix_and_depth_validation(self):
         images, alpha = synthetic()
         for prefix in ("../escape", "/absolute", "bad%03d", "C:\\bad", ""):
@@ -651,7 +708,10 @@ class VideoMaskIOTests(unittest.TestCase):
         loaded = io.LoadVideoWithMask().load_video(path.name, skip_first_frames=6, frame_load_cap=3)
         results = loaded["result"]
         self.assertEqual(results[2:4], (3, 12))
-        self.assertTrue(json.loads(results[4])["has_audio"])
+        metadata = json.loads(results[4])
+        self.assertTrue(metadata["has_audio"])
+        self.assertEqual((metadata["source_width"], metadata["source_height"], metadata["source_frame_count"]), (32, 24, 24))
+        self.assertEqual((metadata["source_duration"], metadata["loaded_duration"]), (2.0, 0.25))
         audio = results[5]
         self.assertEqual(audio["sample_rate"], 48000)
         self.assertEqual(audio["waveform"].shape, (1, 1, 12000))

@@ -86,6 +86,7 @@ async function fixture(name, status = 200, deferUpload = false) {
         const combineWidgets = () => [
             {name: "format", value: PRORES},
             {name: "mask_mode", type: "combo", value: "error", options: {serialize: true}},
+            {name: "crf", type: "number", value: 18, options: {serialize: true}},
         ];
         class Node {
             constructor() {
@@ -274,7 +275,7 @@ test("還原舊來源及變更選幀參數會更新預覽", async () => {
 const media = {preview: "/logiclite/video-mask/test/preview", raw: "/logiclite/video-mask/test/raw"};
 const output = {mask_video_previews: [media], mask_video_files: ["D:\\output\\shot\\manifest.json"]};
 const previewActions = ["Pause preview", "Hide preview", "Sync preview", "Download raw"];
-const loaderActions = type => type === LOAD_ID ? ["Open preview", "Save preview"] : [];
+const fileActions = ["Open preview", "Save preview"];
 
 function menuItems(node) {
     const options = node.canvas.getNodeMenuOptions(node);
@@ -299,7 +300,7 @@ test("both preview menus survive chained third-party hooks and a wrapped node re
         node.onExecuted(output);
         const items = menuItems(new Proxy(node, {}));
         assert.deepEqual(Array.from(items, item => item.content), [
-            ...previewActions, ...loaderActions(type),
+            ...previewActions, ...fileActions,
             "Earlier returned item", "Later extension", "Earlier extension",
         ]);
         items[0].callback();
@@ -313,13 +314,17 @@ test("a node-level menu replacement still keeps the loaded preview actions", asy
         Node.prototype.getExtraMenuOptions = () => [{content: "Replacement extension"}];
         node.onExecuted(output);
         assert.deepEqual(Array.from(menuItems(node), item => item.content), [
-            ...previewActions, ...loaderActions(type), "Replacement extension",
+            ...previewActions, ...fileActions, "Replacement extension",
         ]);
     }
 });
 
 test("預覽依實際比例配合節點寬度，並只在滑鼠移入時開啟聲音", async () => {
-    const {node, elements} = await fixture(LOAD_ID);
+    for (const type of [LOAD_ID, SAVE_ID]) await checkAudioPreview(type);
+});
+
+async function checkAudioPreview(type) {
+    const {node, elements} = await fixture(type);
     const source = {width: 200, height: 300, fps: 29.97, frames: 60, has_audio: true};
     node.onExecuted({mask_video_previews: [{...media, source}]});
     const {container, options} = node.dom[0];
@@ -349,7 +354,7 @@ test("預覽依實際比例配合節點寬度，並只在滑鼠移入時開啟�
     action("Save preview");
     assert.equal(elements.at(-1).href, `/prefix${media.preview}`);
     assert.equal(elements.at(-1).download, "preview.webm");
-});
+}
 
 test("both nodes play muted looping video without path text and release old media", async () => {
     for (const type of [LOAD_ID, SAVE_ID]) {
@@ -358,6 +363,7 @@ test("both nodes play muted looping video without path text and release old medi
         assert.equal(node.dom.length, 1);
         const {container, options} = node.dom[0];
         assert.equal(options.serialize, false);
+        assert.equal(options.hideOnZoom, false);
         assert.equal(container.children.length, 1);
         const video = container.children[0];
         assert.equal(video.tag, "video");
@@ -381,9 +387,11 @@ test("both nodes play muted looping video without path text and release old medi
 
 test("Combine shows mask_mode only for no-mask formats and keeps its value and type", async () => {
     const {node} = await fixture(SAVE_ID);
-    const [format, maskMode] = node.widgets;
+    const [format, maskMode, crf] = node.widgets;
     assert.equal(node.onNodeCreated(), "created");
     assert.equal(maskMode.hidden, true);
+    assert.equal(crf.hidden, true);
+    crf.value = 24;
     maskMode.value = "separate_png";
 
     for (const alphaFormat of [PRORES, "[mask] ProRes 4444 XQ (.mov)", "[mask] VP9 alpha (.webm)",
@@ -392,14 +400,17 @@ test("Combine shows mask_mode only for no-mask formats and keeps its value and t
         format.value = H264;
         assert.equal(node.onWidgetChanged("format", H264, previous, format), "changed");
         assert.equal(maskMode.hidden, false);
+        assert.equal(crf.hidden, false);
         previous = format.value;
         format.value = alphaFormat;
         node.onWidgetChanged("format", alphaFormat, previous, format);
         assert.equal(maskMode.hidden, true);
+        assert.equal(crf.hidden, true);
     }
     assert.equal(maskMode.value, "separate_png");
     assert.equal(maskMode.type, "combo");
     assert.equal(maskMode.options.serialize, true);
+    assert.equal(crf.value, 24);
 });
 
 test("Combine reapplies mask_mode visibility after restoring values and recreating widgets", async () => {
@@ -434,7 +445,7 @@ test("both node menus pause, hide, sync the current graph and download raw", asy
     const video = node => node.dom[0].container.children[0];
     const action = (node, label) => menuItems(node).find(item => item.content === label).callback();
     for (const node of [load, save]) {
-        assert.deepEqual(menuItems(node).map(item => item.content), [...previewActions, ...loaderActions(node === load ? LOAD_ID : SAVE_ID)]);
+        assert.deepEqual(menuItems(node).map(item => item.content), [...previewActions, ...fileActions]);
         action(node, "Pause preview");
         assert.equal(video(node).paused, true);
         assert.equal(video(node).autoplay, false);

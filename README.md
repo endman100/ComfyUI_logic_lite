@@ -24,7 +24,7 @@ CPU checks: `python -B tests/run_cpu_tests.py --comfy-root /path/to/ComfyUI` and
 
 遮罩極性請分清楚：**本套件兩個 I/O 節點：MASK = alpha = 前景白色／不透明，不反相；VHS FFmpeg 重載：MASK = 1−alpha；核心「Join Image with Alpha」：A = 1−mask**。將本套件 MASK 接到該核心 Join 節點前，須先反相。
 
-RGBA 影片走 16-bit pipe，PNG16 不經 Pillow 量化；OpenCV EXR32 保留 float32、負值與 HDR 範圍，不套用色彩轉換；支援一般單層 scanline EXR，不支援 tiled／deep／multipart。整數格式限制至 0..1。ProRes 4444／XQ 使用 `rgba64le → -c:v prores_ks -profile:v 4444/4444xq -pix_fmt yuva444p12le -alpha_bits 16`，**不強制 BT.709 scale／range 轉換或色彩標籤**；不會先降成 RGBA8。`bit_depth=12` 是要求值，不保證編碼器保留完整 12-bit：本機 ffmpeg 7.1.5 的 `prores_ks` 會警告並自動改用 `yuva444p10le`，解碼顯示 `yuva444p12le` 也不能證明全程 12-bit 精度。3 格 32×24 合成樣本的兩種 profile 往返最大差皆為 RGB 約 0.00170711、alpha 約 0.00122583（約 80/65535），均非數值無損；XQ 名稱也不代表已做 HDR 色彩管理。VP9 alpha 為 8-bit、4:2:0，讀取時強制 libvpx 解碼；VP9／H.264 需要偶數寬高。Video Combine 的匯出為靜音影片。
+RGBA 影片走 16-bit pipe，PNG16 不經 Pillow 量化；OpenCV EXR32 保留 float32、負值與 HDR 範圍，不套用色彩轉換；支援一般單層 scanline EXR，不支援 tiled／deep／multipart。整數格式限制至 0..1。ProRes 4444／XQ 使用 `rgba64le → -c:v prores_ks -profile:v 4444/4444xq -pix_fmt yuva444p12le -alpha_bits 16`，**不強制 BT.709 scale／range 轉換或色彩標籤**；不會先降成 RGBA8。`bit_depth=12` 是要求值，不保證編碼器保留完整 12-bit：本機 ffmpeg 7.1.5 的 `prores_ks` 會警告並自動改用 `yuva444p10le`，解碼顯示 `yuva444p12le` 也不能證明全程 12-bit 精度。3 格 32×24 合成樣本的兩種 profile 往返最大差皆為 RGB 約 0.00170711、alpha 約 0.00122583（約 80/65535），均非數值無損；XQ 名稱也不代表已做 HDR 色彩管理。VP9 alpha 為 8-bit、4:2:0，讀取時強制 libvpx 解碼；VP9／H.264 需要偶數寬高。Video Combine 可接選填 AUDIO。MP4 使用 AAC，ProRes MOV 使用 PCM，VP9 WebM 使用 Opus。音軌按實際輸出影片長度裁剪或補靜音，PNG16／EXR 序列不寫音軌。點選 `pingpong` 在正播後倒播，首尾格不重複，遮罩同步。H.264 提供 `crf`，預設 18。內嵌有聲預覽在滑鼠移入時開聲，移出時恢復靜音。
 
 輸出在 ComfyUI output（`save_output=false` 則 temp）下的唯一資料夾，含主檔／序列、fps 與路徑的 `manifest.json`，並回傳 JSON 檔案路徑。
 

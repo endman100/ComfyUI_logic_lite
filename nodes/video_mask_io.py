@@ -1,6 +1,8 @@
 """獨立實作的高精度影片／遮罩 I/O，不依賴 VideoHelperSuite。"""
 
 import asyncio
+from collections.abc import Mapping
+from contextlib import ExitStack
 from fractions import Fraction
 import glob
 from hashlib import sha256
@@ -532,10 +534,11 @@ class LoadVideoWithMask:
             raise ValueError("目前僅支援 90 度倍數的影片旋轉資訊")
         turns = round(rotation / 90) % 4
         display_w, display_h = (source_h, source_w) if turns % 2 else (source_w, source_h)
+        source_frames = len(files) if files is not None else _video_load_estimate(info, 0, 0, 1, 0)
         source = None
         if files is None:
             source = {"width": display_w, "height": display_h, "fps": source_fps,
-                      "frames": _video_load_estimate(info, 0, 0, 1, 0), "has_audio": info["audio"] is not None}
+                      "frames": source_frames, "has_audio": info["audio"] is not None}
         if _preview_only and reuse_preview:
             return _media_ui(first, (first,), source=source)
         width = width or (max(1, round(display_w * height / display_h)) if height else display_w)
@@ -590,6 +593,9 @@ class LoadVideoWithMask:
         audio = (_load_audio(first, info["audio"], skip / rate, len(rgba) / fps, ffmpeg)
                  if files is None and info["audio"] else None)
         metadata = {"source": str(first), "source_fps": source_fps, "fps": fps,
+                    "source_width": display_w, "source_height": display_h, "source_frame_count": source_frames,
+                    "source_duration": source_frames / source_fps if files is not None else info["duration_seconds"],
+                    "loaded_duration": len(rgba) / fps,
                     "frame_count": len(rgba), "width": width, "height": height,
                     "has_alpha": info["has_alpha"], "source_pix_fmt": info.get("pix_fmt"),
                     "source_rotation": rotation,
@@ -641,17 +647,30 @@ def _validate_images(images, mask):
     return mask
 
 
-def _rgba_chunks(images, mask, repetitions, half=False, mask_only=False, preview_size=None):
-    count, height, width = images.shape[:3]
+def _validate_audio(audio):
+    if not isinstance(audio, Mapping):
+        raise ValueError("audio 必須為 ComfyUI AUDIO")
+    waveform = audio.get("waveform")
+    if (not isinstance(waveform, torch.Tensor) or waveform.ndim != 3 or waveform.shape[0] != 1
+            or min(waveform.shape) < 1 or not waveform.is_floating_point()):
+        raise ValueError("audio waveform 必須為非空的 [1, channels, samples] 浮點張量")
+    return waveform, _integer(audio.get("sample_rate"), "audio sample_rate", 1)
+
+
+def _rgba_chunks(images, mask, repetitions, half=False, mask_only=False, preview_size=None, order=None):
+    height, width = images.shape[1:3]
+    count = len(images) if order is None else len(order)
     batch_size = max(1, _BUFFER_BYTES // (height * width * 4 * 4))
     # 只依有界 I/O 批次與播放次數迭代；轉換在整個批次上向量化，不逐像素處理。
     for _ in range(repetitions):
         for start in range(0, count, batch_size):
-            rgb = images[start:start + batch_size, ..., :3].detach().to(device="cpu", dtype=torch.float32)
+            chunk = slice(start, start + batch_size)
+            indices = chunk if order is None else order[chunk]
+            rgb = images[indices, ..., :3].detach().to(device="cpu", dtype=torch.float32)
             if mask is not None:
-                alpha = mask[start:start + batch_size].detach().to(device="cpu", dtype=torch.float32).unsqueeze(-1)
+                alpha = mask[indices].detach().to(device="cpu", dtype=torch.float32).unsqueeze(-1)
             elif images.shape[-1] == 4:
-                alpha = images[start:start + batch_size, ..., 3:].detach().to(device="cpu", dtype=torch.float32)
+                alpha = images[indices, ..., 3:].detach().to(device="cpu", dtype=torch.float32)
             else:
                 alpha = torch.ones_like(rgb[..., :1])
             if preview_size is None and (not torch.isfinite(rgb).all() or not torch.isfinite(alpha).all()):
@@ -670,36 +689,47 @@ def _rgba_chunks(images, mask, repetitions, half=False, mask_only=False, preview
 
 
 def _encode(destination, kind, depth, images, mask, frame_rate, repetitions, ffmpeg,
-            mask_only=False, preview_size=None, progress=None, audio_args=()):
+            mask_only=False, preview_size=None, progress=None, audio_args=(), audio=None, order=None, crf=18):
     height, width = preview_size or images.shape[1:3]
     floating = kind == "exr"
     raw_format = "rgba" if kind == "preview" else ("gbrapf32le" if floating else "rgba64le")
     command = [ffmpeg, "-v", "error", "-nostdin", "-n", "-f", "rawvideo", "-pixel_format", raw_format,
                "-video_size", f"{width}x{height}", "-framerate", str(frame_rate), "-i", "pipe:0"]
-    command += audio_args or ("-an",)
+    output = []
     if kind in ("prores", "prores_xq"):
-        command += ["-c:v", "prores_ks", "-profile:v", "4444xq" if kind == "prores_xq" else "4444",
-                    "-pix_fmt", "yuva444p12le", "-alpha_bits", "16"]
+        output += ["-c:v", "prores_ks", "-profile:v", "4444xq" if kind == "prores_xq" else "4444",
+                   "-pix_fmt", "yuva444p12le", "-alpha_bits", "16"]
     elif kind in ("vp9", "preview"):
-        command += ["-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p", "-auto-alt-ref", "0"]
+        output += ["-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p", "-auto-alt-ref", "0"]
         if kind == "preview":
-            command += ["-deadline", "realtime", "-cpu-used", "6", "-b:v", "300k", "-crf", "38"]
+            output += ["-deadline", "realtime", "-cpu-used", "6", "-b:v", "300k", "-crf", "38"]
         else:
-            command += ["-lossless", "1"]
+            output += ["-lossless", "1"]
     elif kind == "png":
-        command += ["-c:v", "png", "-pix_fmt", "rgba64be", "-start_number", "0"]
+        output += ["-c:v", "png", "-pix_fmt", "rgba64be", "-start_number", "0"]
     elif kind == "exr":
-        command += ["-c:v", "exr", "-pix_fmt", "gbrapf32le", "-format", "half" if depth == "half" else "float",
-                    "-compression", "zip16", "-start_number", "0"]
+        output += ["-c:v", "exr", "-pix_fmt", "gbrapf32le", "-format", "half" if depth == "half" else "float",
+                   "-compression", "zip16", "-start_number", "0"]
     elif kind == "h264":
-        command += ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", "-movflags", "+faststart"]
-    command += ["-threads", "2", str(destination)]
-    with tempfile.TemporaryFile() as log:
+        output += ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", str(crf), "-movflags", "+faststart"]
+    with tempfile.TemporaryFile() as log, ExitStack() as files:
+        if audio is not None:
+            waveform, sample_rate = audio
+            frame_count = (len(images) if order is None else len(order)) * repetitions
+            duration = frame_count / frame_rate
+            samples = max(1, math.ceil(duration * sample_rate))
+            audio_path = Path(files.enter_context(tempfile.TemporaryDirectory())) / "waveform.f32"
+            pcm = waveform[0, :, :samples].detach().to(device="cpu", dtype=torch.float32).transpose(0, 1).numpy()
+            np.asarray(pcm, dtype="<f4").tofile(audio_path)
+            codec = {"vp9": "libopus", "prores": "pcm_s16le", "prores_xq": "pcm_s16le", "h264": "aac"}[kind]
+            audio_args = ["-f", "f32le", "-ar", str(sample_rate), "-ac", str(waveform.shape[1]), "-i", str(audio_path),
+                          "-map", "0:v:0", "-map", "1:a:0", "-af", f"apad,atrim=duration={duration}", "-c:a", codec]
+        command += [*(audio_args or ("-an",)), *output, "-threads", "2", str(destination)]
         process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=log)
         try:
             try:
                 for rgba in _rgba_chunks(images, mask, repetitions, half=depth == "half", mask_only=mask_only,
-                                         preview_size=preview_size):
+                                         preview_size=preview_size, order=order):
                     if floating:
                         data = np.ascontiguousarray(rgba[..., [1, 2, 0, 3]].transpose(0, 3, 1, 2), dtype="<f4")
                     elif kind == "preview":
@@ -733,17 +763,18 @@ def _preview_sampling(frame_rate):
 
 
 def _write_preview(destination, images, mask, frame_rate, ffmpeg, progress=None,
-                   *, audio_path=None, audio_start=0, input_flags=()):
+                   *, audio_path=None, audio_start=0, input_flags=(), order=None):
     sample, fps = _preview_sampling(frame_rate)
     scale = min(1, 480 / max(images.shape[1:3]))
     size = tuple(max(2, 2 * math.floor(dimension * scale / 2)) for dimension in images.shape[1:3])
-    frames = images[sample]
+    selection = sample if order is None else order[sample]
+    frames = images[selection]
     audio_args = ()
     if audio_path is not None:
         audio_args = [*input_flags, "-ss", str(audio_start), "-i", str(audio_path),
                       "-map", "0:v:0", "-map", "1:a:0", "-af", f"atrim=duration={len(frames) / fps}",
                       "-c:a", "libopus", "-b:a", "64k"]
-    _encode(destination, "preview", "8", frames, None if mask is None else mask[sample],
+    _encode(destination, "preview", "8", frames, None if mask is None else mask[selection],
             fps, 1, ffmpeg, preview_size=size, progress=progress, audio_args=audio_args)
 
 
@@ -774,7 +805,9 @@ class VideoCombineWithMask:
             "mask_mode": (["error", "separate_png", "ignore"], {"default": "error", "tooltip": "不支援 alpha 的格式：報錯／另存 PNG16 遮罩序列／忽略遮罩"}),
             "save_mask_sequence": ("BOOLEAN", {"default": False, "tooltip": "不論主格式是否支援 alpha，額外保存可重載 MASK 的 PNG16 序列"}),
             "bit_depth": (["auto", "8", "12", "16", "half", "float"], {"default": "auto", "tooltip": "auto：ProRes 要求 12-bit（實際精度受編碼器限制）、VP9/H.264 8、PNG 16、EXR float；EXR 另可選 half"}),
-        }, "optional": {"mask": ("MASK",)}}
+            "pingpong": ("BOOLEAN", {"default": False, "tooltip": "正向播放後反向播放，首尾格不重複"}),
+        }, "optional": {"mask": ("MASK",), "audio": ("AUDIO",),
+                        "crf": ("INT", {"default": 18, "min": 0, "max": 51, "tooltip": "僅 H.264。數值越低，畫質越高"})}}
 
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("filenames",)
@@ -785,7 +818,7 @@ class VideoCombineWithMask:
 
     def combine_video(self, images, frame_rate=24.0, loop_count=0, filename_prefix="mask_video",
                       format="[mask] ProRes 4444 (.mov)", save_output=True, mask_mode="error",
-                      save_mask_sequence=False, bit_depth="auto", mask=None):
+                      save_mask_sequence=False, bit_depth="auto", mask=None, audio=None, pingpong=False, crf=18):
         mask = _validate_images(images, mask)
         frame_rate = _rate(frame_rate, "frame_rate")
         repetitions = _integer(loop_count, "loop_count", 0) + 1
@@ -794,6 +827,10 @@ class VideoCombineWithMask:
         if mask_mode not in ("error", "separate_png", "ignore"):
             raise ValueError("mask_mode 必須是 error、separate_png 或 ignore")
         kind, extension, default_depth = FORMATS[format]
+        sequence = kind in ("png", "exr")
+        audio = _validate_audio(audio) if audio is not None and not sequence else None
+        if kind == "h264" and _integer(crf, "crf", 0) > 51:
+            raise ValueError("H.264 crf 必須介於 0 和 51")
         depth = default_depth if bit_depth == "auto" else bit_depth
         if depth not in (("half", "float") if kind == "exr" else (default_depth,)):
             raise ValueError(f"{format} 不支援 bit_depth={bit_depth}；有效選項為 auto 或 "
@@ -805,41 +842,48 @@ class VideoCombineWithMask:
             raise ValueError("H.264／VP9 的 4:2:0 格式需要偶數寬高；不會自動裁切或補邊")
         ffmpeg = find_ffmpeg()
         extra_mask = has_mask and (save_mask_sequence or (kind == "h264" and mask_mode == "separate_png"))
-        frame_count = len(images) * repetitions
-        preview_frames = len(images[_preview_sampling(frame_rate)[0]]) if kind != "vp9" else 0
+        order = None
+        if pingpong and len(images) > 2:
+            order = torch.cat((torch.arange(len(images)), torch.arange(len(images) - 2, 0, -1)))
+        cycle = len(images) if order is None else len(order)
+        frame_count = cycle * repetitions
+        preview_frames = len(range(cycle)[_preview_sampling(frame_rate)[0]]) if kind != "vp9" else 0
         # Finish only after FFmpeg has flushed its last pass and the output is registered.
         progress = ProgressBar(frame_count * (1 + extra_mask) + preview_frames + 1)
         directory = _output_directory(filename_prefix, save_output)
-        sequence = kind in ("png", "exr")
         if sequence:
             (directory / "frames").mkdir()
             destination = directory / "frames" / f"%08d.{extension}"
         else:
             destination = directory / f"video.{extension}"
-        _encode(destination, kind, depth, images, mask, frame_rate, repetitions, ffmpeg, progress=progress)
+        _encode(destination, kind, depth, images, mask, frame_rate, repetitions, ffmpeg,
+                progress=progress, audio=audio, order=order, crf=crf)
         paths = [str(destination)]
         if extra_mask:
             (directory / "mask").mkdir()
             mask_destination = directory / "mask" / "%08d.png"
             _encode(mask_destination, "png", "16", images, mask, frame_rate, repetitions, ffmpeg,
-                    mask_only=True, progress=progress)
+                    mask_only=True, progress=progress, order=order)
             paths.append(str(mask_destination))
         metadata = {"format": format, "bit_depth": depth, "fps": frame_rate,
                     "frame_count": frame_count, "alpha_convention": "mask=alpha",
-                    "mask_sequence": len(paths) > 1, "files": paths}
+                    "mask_sequence": len(paths) > 1, "has_audio": audio is not None, "files": paths}
         manifest = directory / "manifest.json"
         manifest.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
         paths.append(str(manifest))
         preview = destination
         if kind != "vp9":
             preview = directory / "preview.webm"
-            _write_preview(preview, images, mask, frame_rate, ffmpeg, progress=progress)
+            _write_preview(preview, images, mask, frame_rate, ffmpeg, progress=progress,
+                           audio_path=destination if audio is not None else None, order=order)
         raw = [destination]
         if sequence:
             raw = [manifest, *(destination.with_name(destination.name % index) for index in range(frame_count))]
             if extra_mask:
                 raw.extend(mask_destination.with_name(mask_destination.name % index) for index in range(frame_count))
-        ui = _media_ui(preview, raw, directory if sequence else None)
+        source = {"width": images.shape[2], "height": images.shape[1], "fps": frame_rate,
+                  "frames": frame_count, "has_audio": audio is not None}
+        ui = _media_ui(preview, raw, directory if sequence else None, source=source)
         progress.update(1)
         return {"ui": ui, "result": (json.dumps(paths, ensure_ascii=False),)}
 
